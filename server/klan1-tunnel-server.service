@@ -1,0 +1,33 @@
+[Unit]
+Description=klan1-tunnel API server (self-hosted ngrok-like)
+Documentation=https://github.com/klan1/klan1-tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /usr/local/bin/klan1-tunnel-server.py \
+    --port 65500 \
+    --bind 127.0.0.1 \
+    --state /var/lib/klan1-tunnel/state.json \
+    --key-dir /etc/klan1-tunnel \
+    --port-lo 65081 \
+    --port-hi 65090 \
+    --default-ttl 86400
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=klan1-tunnel-server
+
+# Hardening (basic)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/klan1-tunnel /etc/klan1-tunnel
+
+[Install]
+WantedBy=multi-user.target

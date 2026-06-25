@@ -1,0 +1,90 @@
+# /etc/caddy/Caddyfile — bloque para klan1-tunnel
+# Reverse proxy de los 10 subdominios preconfigurados al API server en loopback
+# Cada subdominio mapea 1:1 a un puerto local del API (65081-65090)
+#
+# Estrategia TLS: 10 sitios EXPLÍCITOS (no wildcard).
+# Cada subdominio emite su propio cert vía Cloudflare DNS challenge.
+# - Ventaja: si 1 falla, los otros 9 siguen funcionando
+# - Ventaja: logs claros por subdominio
+# - Ventaja: cuando vayamos a on-demand (paso 11), agregar un subdominio nuevo es trivial
+# - Costo: 10 emisiones en paralelo (~30s total, no es problema)
+#
+# IMPORTANTE: este bloque va en /etc/caddy/Caddyfile en el server
+# que actúa como API server (típicamente el `primary` de tu fleet.json).
+# Los subdominios N.tunnels.<your-domain> DEBEN apuntar en DNS a la IP
+# pública del server donde corre Caddy. Si apuntan a otro server,
+# el handshake TLS no llega nunca a este Caddy.
+#
+# Token: REEMPLAZAR <CLOUDFLARE_API_TOKEN> con el real antes de deployar.
+# El token real NO debe estar commiteado. Mantenlo en un archivo no
+# trackeado (p.ej. /etc/caddy/cloudflare.env) y cárgalo con `import`.
+
+1.tunnels.<your-domain> {
+    tls {
+        dns cloudflare <CLOUDFLARE_API_TOKEN>
+    }
+    reverse_proxy 127.0.0.1:65081
+}
+
+2.tunnels.<your-domain> {
+    tls {
+        dns cloudflare <CLOUDFLARE_API_TOKEN>
+    }
+    reverse_proxy 127.0.0.1:65082
+}
+
+3.tunnels.<your-domain> {
+    tls {
+        dns cloudflare <CLOUDFLARE_API_TOKEN>
+    }
+    reverse_proxy 127.0.0.1:65083
+}
+
+4.tunnels.<your-domain> {
+    tls {
+        dns cloudflare <CLOUDFLARE_API_TOKEN>
+    }
+    reverse_proxy 127.0.0.1:65084
+}
+
+5.tunnels.<your-domain> {
+    tls {
+        dns cloudflare <CLOUDFLARE_API_TOKEN>
+    }
+    reverse_proxy 127.0.0.1:65085
+}
+
+6.tunnels.<your-domain> {
+    tls {
+        dns cloudflare <CLOUDFLARE_API_TOKEN>
+    }
+    reverse_proxy 127.0.0.1:65086
+}
+
+7.tunnels.<your-domain> {
+    tls {
+        dns cloudflare <CLOUDFLARE_API_TOKEN>
+    }
+    reverse_proxy 127.0.0.1:65087
+}
+
+8.tunnels.<your-domain> {
+    tls {
+        dns cloudflare <CLOUDFLARE_API_TOKEN>
+    }
+    reverse_proxy 127.0.0.1:65088
+}
+
+9.tunnels.<your-domain> {
+    tls {
+        dns cloudflare <CLOUDFLARE_API_TOKEN>
+    }
+    reverse_proxy 127.0.0.1:65089
+}
+
+10.tunnels.<your-domain> {
+    tls {
+        dns cloudflare <CLOUDFLARE_API_TOKEN>
+    }
+    reverse_proxy 127.0.0.1:65090
+}
