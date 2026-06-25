@@ -662,19 +662,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/healthz":
             self._send_json(200, {"ok": True, "time": now_utc()})
         elif path == "/":
-            # Parse query string for flash message
+            # Parse query string for flash + filter
             query = urllib.parse.parse_qs(url.query)
             flash_msg = (query.get("flash") or [None])[0]
             flash_kind = (query.get("kind") or ["info"])[0]
             if flash_kind not in ("ok", "err", "info"):
                 flash_kind = "info"
+            filter_q = (query.get("q") or [""])[0]
             self._send_html(200, render_dashboard(
                 self.state.list(),
                 self.state.port_lo,
                 self.state.port_hi,
                 flash_msg=flash_msg,
                 flash_kind=flash_kind,
+                filter_q=filter_q,
             ))
+        elif path == "/dashboard/ssh-command":
+            # GET endpoint used by the "ssh" button JS to fetch command info.
+            query = urllib.parse.parse_qs(url.query)
+            token = (query.get("token") or [""])[0]
+            t = self.state.data["tunnels"].get(token)
+            if not t:
+                return self._send_json(404, {"error": "not_found"})
+            self._send_json(200, {
+                "user": f"tunnel-{t.get('remote_port', '')}",
+                "port": t.get("remote_port", ""),
+                "host": API_HOST,
+                "local_port": 8080,
+            })
         elif path == "/api/v1/tunnels":
             tunnels = self.state.list()
             self._send_json(200, {"tunnels": tunnels, "count": len(tunnels)})
@@ -699,9 +714,91 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # Dashboard control endpoints (NO AUTH for now — solo management).
         # Returns HTTP 303 redirect to / after action so the browser
         # re-renders the dashboard with a flash message.
+
+        if path == "/dashboard/provision":
+            # Provision a new tunnel: provision on-demand user + reserve port.
+            form = self._read_form() or {}
+            name = _str(form.get("name")).strip()
+            subdomain_str = _str(form.get("subdomain")).strip()
+            proto = _str(form.get("protocol") or "http").strip().lower()
+            try:
+                local_port = int(_str(form.get("local_port") or 8080))
+            except (TypeError, ValueError):
+                local_port = 8080
+
+            if not name:
+                return self._dashboard_redirect("Name es requerido", "err")
+            if proto not in ("http", "socks5", "tcp"):
+                proto = "http"
+            try:
+                subdomain = int(subdomain_str) if subdomain_str else None
+            except ValueError:
+                return self._dashboard_redirect(f"Subdomain inválido: {subdomain_str}", "err")
+
+            if subdomain is None:
+                return self._dashboard_redirect("Subdomain es requerido", "err")
+
+            try:
+                prov = provision_tunnel_user(str(subdomain))
+                if not prov.get("ok"):
+                    return self._dashboard_redirect(
+                        f"No se pudo provisionar tunnel-{prov.get('port','?')}: {prov.get('error')}",
+                        "err",
+                    )
+                rport = prov["port"]
+                tunnel_user = prov["user"]
+                private_key = prov["private_key"]
+            except Exception as e:
+                return self._dashboard_redirect(f"Exception en provision: {e}", "err")
+
+            res = self.state.reserve(name, rport, proto, "primary", "dashboard", 86400)
+            if not res.get("ok"):
+                return self._dashboard_redirect(f"No se pudo reservar: {res}", "err")
+
+            token = res["token"]
+            ssh_cmd = (
+                f"ssh -i ~/.klan1-tunnel/id_ed25519_{tunnel_user} "
+                f"-N -T -R {rport}:127.0.0.1:{local_port} "
+                f"{tunnel_user}@{API_HOST}"
+            )
+            fqdn = f"{subdomain}.{BASE_DOMAIN}"
+            # Show the SSH command + private key inline in the dashboard
+            return self._send_html(200, render_dashboard(
+                self.state.list(),
+                self.state.port_lo,
+                self.state.port_hi,
+                flash_msg=f"Túnel '{name}' creado en https://{fqdn} — copia la SSH key ABAJO",
+                flash_kind="ok",
+                private_key_for_token=private_key,
+                ssh_command_for_token=ssh_cmd,
+            ))
+
+        if path == "/dashboard/release-bulk":
+            form = self._read_form() or {}
+            tokens = form.get("tokens") or []
+            if isinstance(tokens, str):
+                tokens = [tokens]
+            if not tokens:
+                return self._dashboard_redirect("Ningún túnel seleccionado", "err")
+            deleted = 0
+            for tok in tokens:
+                tok = tok.strip()
+                if not tok:
+                    continue
+                t = self.state.data["tunnels"].get(tok)
+                if t:
+                    port = t.get("remote_port")
+                    res = self.state.release(tok)
+                    if res.get("ok"):
+                        deleted += 1
+                        self._remove_tunnel_user(port)
+            return self._dashboard_redirect(
+                f"{deleted} túnel(es) borrado(s)", "ok" if deleted else "err"
+            )
+
         if path == "/dashboard/release":
             form = self._read_form() or {}
-            token = (form.get("token") or "").strip()
+            token = _str(form.get("token")).strip()
             if not token:
                 return self._send_json(400, {"error": "token_required"})
             t = self.state.data["tunnels"].get(token)
@@ -720,8 +817,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if path == "/dashboard/extend":
             form = self._read_form() or {}
-            token = (form.get("token") or "").strip()
-            ttl_str = (form.get("ttl") or "86400").strip()
+            token = _str(form.get("token")).strip()
+            ttl_str = _str(form.get("ttl") or "86400").strip()
             try:
                 ttl = int(ttl_str)
             except ValueError:
@@ -868,10 +965,49 @@ class Handler(http.server.BaseHTTPRequestHandler):
 # Dashboard HTML (single-file, dark theme, no JS deps)
 # ----------------------------------------------------------------------------
 
-def render_dashboard(tunnels, port_lo, port_hi, flash_msg=None, flash_kind="info"):
+# Heartbeat health thresholds (seconds since last heartbeat)
+# Same as client-side HEARTBEAT_INTERVAL=30 * HEARTBEAT_GRACE=3 = 90s, plus a buffer.
+_HEALTH_OK_SECS = 90
+_HEALTH_WARN_SECS = 180
+
+
+def _health_badge(secs_since_hb: int) -> str:
+    if secs_since_hb < 0:
+        return '<span class="badge badge-stale">never</span>'
+    if secs_since_hb <= _HEALTH_OK_SECS:
+        cls, label = "badge-ok", "ok"
+    elif secs_since_hb <= _HEALTH_WARN_SECS:
+        cls, label = "badge-warn", "stale"
+    else:
+        cls, label = "badge-stale", "dead"
+    return f'<span class="badge {cls}">{label}</span>'
+
+
+def _secs_since_hb(t: dict) -> int:
+    hb = parse_iso_utc(t.get("last_heartbeat", ""))
+    if not hb:
+        return -1
+    return int((datetime.datetime.now(datetime.timezone.utc) - hb).total_seconds())
+
+
+def render_dashboard(tunnels, port_lo, port_hi, flash_msg=None, flash_kind="info",
+                     filter_q="", private_key_for_token=None, ssh_command_for_token=None):
     taken = {t["remote_port"] for t in tunnels}
     free = [p for p in range(port_lo, port_hi + 1) if p not in taken]
     now = now_utc()
+
+    # Apply filter (server-side; matches name, server, port, protocol, egress_ip)
+    q = (filter_q or "").strip().lower()
+    if q:
+        tunnels = [
+            t for t in tunnels
+            if q in str(t.get("name", "")).lower()
+            or q in str(t.get("server_alias", "")).lower()
+            or q in str(t.get("remote_port", ""))
+            or q in str(t.get("protocol", "")).lower()
+            or q in str(t.get("egress_ip", "")).lower()
+        ]
+
     rows = []
     for t in sorted(tunnels, key=lambda x: (x.get("server_alias", ""), x.get("remote_port", 0))):
         exp = parse_iso_utc(t.get("expires_at", ""))
@@ -889,14 +1025,24 @@ def render_dashboard(tunnels, port_lo, port_hi, flash_msg=None, flash_kind="info
                 ttl_left = f"{secs // 86400}d{(secs % 86400) // 3600:02d}h"
         token = t.get("token", "")
         token_short = token[:10] + "…" if token else ""
+        hb_secs = _secs_since_hb(t)
+        health = _health_badge(hb_secs)
+
+        # Build the "Show SSH command" button — opens a modal-like alert
+        ssh_btn = (
+            f'<button type="button" class="btn btn-ssh" '
+            f'onclick="showSshCommand({escape_html(token)!r})" '
+            f'title="Ver SSH command">ssh</button>'
+        )
+
         rows.append(f"""
         <tr>
-          <td><code>{escape_html(t.get('name',''))}</code><br><small style="color:#6e7681">{token_short}</small></td>
+          <td><label class="checkbox-cell"><input type="checkbox" name="tokens" value="{escape_html(token)}" form="bulk-form"> <code>{escape_html(t.get('name',''))}</code></label><br><small style="color:#6e7681">{token_short}</small></td>
           <td>{escape_html(t.get('server_alias',''))}</td>
           <td><code>{t.get('remote_port','')}</code></td>
           <td>{escape_html(t.get('protocol',''))}</td>
           <td><code>{escape_html(t.get('egress_ip',''))}</code></td>
-          <td>{ttl_left}</td>
+          <td>{health} <small style="color:#6e7681">{ttl_left}</small></td>
           <td><small>{escape_html(t.get('created_at',''))}</small></td>
           <td class="actions">
             <form method="POST" action="/dashboard/extend" style="display:inline">
@@ -904,6 +1050,7 @@ def render_dashboard(tunnels, port_lo, port_hi, flash_msg=None, flash_kind="info
               <input type="hidden" name="ttl" value="86400">
               <button type="submit" class="btn btn-extend" title="Extender TTL 24h">+24h</button>
             </form>
+            {ssh_btn}
             <form method="POST" action="/dashboard/release" style="display:inline"
                   onsubmit="return confirm('¿Borrar túnel {escape_html(t.get('name',''))} (puerto {t.get('remote_port','')})?');">
               <input type="hidden" name="token" value="{escape_html(token)}">
@@ -917,12 +1064,51 @@ def render_dashboard(tunnels, port_lo, port_hi, flash_msg=None, flash_kind="info
     if flash_msg:
         flash_html = f'<div class="flash flash-{flash_kind}">{escape_html(flash_msg)}</div>'
 
+    # Optional: show SSH command / private key inline if requested
+    ssh_panel_html = ""
+    if ssh_command_for_token or private_key_for_token:
+        parts = []
+        if ssh_command_for_token:
+            parts.append(f'<div class="ssh-label">SSH command:</div><pre class="ssh-block">{escape_html(ssh_command_for_token)}</pre>')
+        if private_key_for_token:
+            parts.append(f'<div class="ssh-label">Private key (copialo YA — solo se muestra una vez):</div><textarea class="ssh-key" rows="10" readonly>{escape_html(private_key_for_token)}</textarea>')
+        ssh_panel_html = '<div class="ssh-panel">' + "".join(parts) + '</div>'
+
+    # Provision form
+    provision_form = f"""
+<div class="provision-card">
+  <h2>Crear nuevo túnel</h2>
+  <form method="POST" action="/dashboard/provision" class="provision-form">
+    <label>Name (device) <input name="name" required placeholder="macbook"></label>
+    <label>Subdomain #
+      <input name="subdomain" type="number" min="1" max="10" required placeholder="1">
+    </label>
+    <label>Protocol
+      <select name="protocol">
+        <option value="http">http</option>
+        <option value="socks5">socks5</option>
+        <option value="tcp">tcp</option>
+      </select>
+    </label>
+    <label>Local port <input name="local_port" type="number" min="1" max="65535" value="8080"></label>
+    <button type="submit" class="btn btn-primary">Provisionar</button>
+  </form>
+</div>"""
+
+    filter_input = f"""
+<form method="GET" action="/" class="filter-form">
+  <input name="q" placeholder="Filtrar (name, port, ip...)" value="{escape_html(filter_q)}" autofocus>
+  <button type="submit">Filtrar</button>
+  <a href="/" class="btn-link">Limpiar</a>
+</form>"""
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>klan1-tunnel dashboard</title>
+<meta http-equiv="refresh" content="15">
 <style>
   body {{ font-family: ui-monospace, 'SF Mono', Menlo, monospace; background: #0d1117; color: #c9d1d9; margin: 0; padding: 24px; }}
   h1 {{ color: #58a6ff; margin: 0 0 8px; font-size: 22px; }}
@@ -945,17 +1131,78 @@ def render_dashboard(tunnels, port_lo, port_hi, flash_msg=None, flash_kind="info
   .btn-danger:hover {{ background: #6e2a2a; color: #fff; }}
   .btn-extend {{ color: #58a6ff; border-color: #1f4d80; }}
   .btn-extend:hover {{ background: #1f4d80; color: #fff; }}
+  .btn-ssh {{ color: #d2a8ff; border-color: #5a3d80; }}
+  .btn-ssh:hover {{ background: #5a3d80; color: #fff; }}
+  .btn-primary {{ color: #fff; background: #1f4d80; border-color: #58a6ff; padding: 6px 16px; }}
+  .btn-primary:hover {{ background: #58a6ff; color: #0d1117; }}
+  .btn-link {{ color: #58a6ff; text-decoration: none; margin-left: 8px; font-size: 13px; }}
   .flash {{ padding: 12px 16px; border-radius: 6px; margin-bottom: 16px; font-size: 14px; }}
   .flash-ok {{ background: #0d4429; border: 1px solid #1f6e3e; color: #56d364; }}
   .flash-err {{ background: #4a0d12; border: 1px solid #8b1a26; color: #ff7b72; }}
   .flash-info {{ background: #0d2944; border: 1px solid #1f4d80; color: #58a6ff; }}
+  .badge {{ display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }}
+  .badge-ok {{ background: #0d4429; color: #56d364; }}
+  .badge-warn {{ background: #5a3d00; color: #f0c674; }}
+  .badge-stale {{ background: #4a0d12; color: #ff7b72; }}
+  .checkbox-cell {{ display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }}
+  .filter-form {{ margin-bottom: 16px; display: flex; gap: 8px; align-items: center; }}
+  .filter-form input {{ background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 6px 12px; font-family: inherit; font-size: 13px; flex: 1; max-width: 400px; }}
+  .filter-form button {{ background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 6px 14px; cursor: pointer; font-family: inherit; font-size: 13px; }}
+  .provision-card {{ background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; margin-bottom: 24px; }}
+  .provision-card h2 {{ margin: 0 0 12px; font-size: 12px; text-transform: uppercase; color: #8b949e; letter-spacing: 0.5px; }}
+  .provision-form {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; align-items: end; }}
+  .provision-form label {{ display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #8b949e; }}
+  .provision-form input, .provision-form select {{ background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 6px 10px; font-family: inherit; font-size: 13px; }}
+  .bulk-bar {{ background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 10px 16px; margin-bottom: 12px; display: flex; gap: 12px; align-items: center; font-size: 13px; }}
+  .bulk-bar span {{ color: #8b949e; }}
+  .ssh-panel {{ background: #161b22; border: 1px solid #58a6ff; border-radius: 6px; padding: 16px; margin-bottom: 16px; }}
+  .ssh-label {{ color: #8b949e; font-size: 12px; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }}
+  .ssh-block {{ background: #0d1117; border: 1px solid #30363d; border-radius: 4px; padding: 10px; font-family: inherit; font-size: 13px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; color: #d2a8ff; }}
+  .ssh-key {{ width: 100%; background: #0d1117; color: #d2a8ff; border: 1px solid #30363d; border-radius: 4px; padding: 10px; font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 12px; resize: vertical; }}
 </style>
+<script>
+  // Show SSH command (and private key if present in window.__lastProvision) by
+  // rebuilding the panel inline. We POST to a tiny endpoint to fetch the
+  // ssh_command for a given token, then display it.
+  function showSshCommand(token) {{
+    fetch('/dashboard/ssh-command?token=' + encodeURIComponent(token))
+      .then(r => r.json())
+      .then(d => {{
+        if (d.error) {{ alert('Error: ' + d.error); return; }}
+        const cmd = 'ssh -i ~/.klan1-tunnel/id_ed25519_' + d.user + ' -N -T -R ' + d.port + ':127.0.0.1:' + (d.local_port || 8080) + ' ' + d.user + '@' + d.host;
+        prompt('Copia este comando y correlo en tu máquina:', cmd);
+      }})
+      .catch(e => alert('Fetch failed: ' + e));
+  }}
+
+  // Bulk actions: select all checkbox toggles all row checkboxes
+  function toggleAll(cb) {{
+    document.querySelectorAll('input[type=checkbox][name=tokens]').forEach(c => {{ c.checked = cb.checked; }});
+  }}
+</script>
 </head>
 <body>
 <h1>klan1-tunnel dashboard</h1>
-<div class="sub">self-hosted ngrok-like tunnels — refreshed {escape_html(now)}</div>
+<div class="sub">self-hosted ngrok-like tunnels — refreshed {escape_html(now)} — auto-refresh 15s</div>
 
 {flash_html}
+
+{ssh_panel_html}
+
+{provision_form}
+
+{filter_input}
+
+<form id="bulk-form" method="POST" action="/dashboard/release-bulk"
+      onsubmit="return confirm('¿Borrar los túneles seleccionados?');">
+  <div class="bulk-bar">
+    <label class="checkbox-cell">
+      <input type="checkbox" onclick="toggleAll(this)" title="Seleccionar todos">
+      <span>Bulk actions</span>
+    </label>
+    <button type="submit" class="btn btn-danger">× Borrar seleccionados</button>
+    <span>(selecciona con los checkboxes de la izquierda)</span>
+  </div>
 
 <div class="grid">
   <div class="card">
@@ -974,16 +1221,26 @@ def render_dashboard(tunnels, port_lo, port_hi, flash_msg=None, flash_kind="info
 
 <table>
   <thead>
-    <tr><th>Name</th><th>Server</th><th>Port</th><th>Proto</th><th>Egress IP</th><th>TTL</th><th>Created</th><th>Actions</th></tr>
+    <tr><th>Name</th><th>Server</th><th>Port</th><th>Proto</th><th>Egress IP</th><th>Health</th><th>Created</th><th>Actions</th></tr>
   </thead>
   <tbody>
     {rows_html}
   </tbody>
 </table>
+</form>
 
-<div class="footer">klan1-tunnel-server v0.2 — dashboard interactivo (sin auth aún)</div>
+<div class="footer">klan1-tunnel-server v0.3 — dashboard interactivo + auto-refresh + filter + bulk + provision</div>
 </body>
 </html>"""
+
+
+def _str(v) -> str:
+    """Coerce form value to string. parse_qs may return lists."""
+    if v is None:
+        return ""
+    if isinstance(v, list):
+        return v[0] if v else ""
+    return str(v)
 
 
 def escape_html(s) -> str:
