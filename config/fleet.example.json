@@ -1,0 +1,47 @@
+{
+  "_comment": "Fleet configuration for klan1-tunnel. Copy this to ~/.klan1-tunnel/fleet.json (or /etc/klan1-tunnel/fleet.json) and fill in your own servers. This file is NOT used at runtime; the real config is fleet.local.json (gitignored). See config/README.md for details.",
+
+  "servers": {
+    "primary": {
+      "_comment": "Primary tunnel server. Required.",
+      "host": "<your-server-ip-or-hostname>",
+      "user": "<ssh-user>",
+      "port": 22
+    },
+    "fallback": {
+      "_comment": "Optional fallback. Omit the entry to skip this server.",
+      "host": "<your-fallback-hostname>",
+      "user": "<ssh-user>",
+      "port": 22
+    },
+    "extra": {
+      "_comment": "Optional third server. Add as many as you need.",
+      "host": "<your-other-hostname>",
+      "user": "<ssh-user>",
+      "port": 22
+    }
+  },
+
+  "server_order": ["primary", "fallback", "extra"],
+
+  "api": {
+    "_comment": "Where the klan1-tunnel-server runs. The install.sh uses this to fetch the tunnel private key.",
+    "url": "https://<your-api-host>"
+  },
+
+  "subdomains": {
+    "_comment": "Pilot mapping of subdomain number -> ssh remote port on the server. Adjust if your deployment uses a different range.",
+    "1": 65081,
+    "2": 65082,
+    "3": 65083,
+    "4": 65084,
+    "5": 65085,
+    "6": 65086,
+    "7": 65087,
+    "8": 65088,
+    "9": 65089,
+    "10": 65090
+  },
+
+  "base_domain": "tunels.<your-domain>"
+}

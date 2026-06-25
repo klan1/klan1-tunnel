@@ -1,0 +1,24 @@
+# State directory (created at runtime, contains secrets)
+.klan1-tunnel/
+
+# Local fleet config (per-host, never commit)
+config/fleet.local.json
+config/fleet.local.*.json
+
+# Logs
+*.log
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor backups
+*.swp
+*.swo
+*~
+*.bak
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
