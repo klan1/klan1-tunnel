@@ -389,6 +389,7 @@ class State:
             created = datetime.datetime.now(datetime.timezone.utc)
             expires = created + datetime.timedelta(seconds=ttl)
             entry = {
+                "token": token,
                 "name": name,
                 "remote_port": port,
                 "protocol": protocol,
@@ -610,8 +611,49 @@ class Handler(http.server.BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         try:
             return json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return {}
+
+    def _read_form(self):
+        """Read application/x-www-form-urlencoded body."""
+        ctype = self.headers.get("Content-Type", "")
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length).decode("utf-8", errors="replace")
+        if "application/x-www-form-urlencoded" in ctype:
+            return {k: v[0] if len(v) == 1 else v
+                    for k, v in urllib.parse.parse_qs(raw).items()}
+        # Fallback: try as JSON if not form-encoded
+        try:
+            return json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            return {}
+
+    def _dashboard_redirect(self, msg: str, kind: str = "info"):
+        """303 redirect to / with flash message in query string."""
+        params = urllib.parse.urlencode({"flash": msg, "kind": kind})
+        self.send_response(303)
+        self.send_header("Location", f"/?{params}")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _remove_tunnel_user(self, port: int):
+        """Best-effort cleanup of the on-demand tunnel user for this port.
+        Called when a tunnel is released. Safe to call multiple times."""
+        if not port:
+            return
+        user = f"tunnel-{port}"
+        # The /api/v1/tunnels DELETE handler already cleans up the user.
+        # This is a no-op safety net for the dashboard-only release path.
+        try:
+            import subprocess
+            subprocess.run(
+                ["userdel", "-r", "-f", user],
+                check=False, capture_output=True, timeout=10,
+            )
         except Exception:
-            return None
+            pass
 
     # ----- routing -----
     def do_GET(self):
@@ -620,7 +662,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/healthz":
             self._send_json(200, {"ok": True, "time": now_utc()})
         elif path == "/":
-            self._send_html(200, render_dashboard(self.state.list(), self.state.port_lo, self.state.port_hi))
+            # Parse query string for flash message
+            query = urllib.parse.parse_qs(url.query)
+            flash_msg = (query.get("flash") or [None])[0]
+            flash_kind = (query.get("kind") or ["info"])[0]
+            if flash_kind not in ("ok", "err", "info"):
+                flash_kind = "info"
+            self._send_html(200, render_dashboard(
+                self.state.list(),
+                self.state.port_lo,
+                self.state.port_hi,
+                flash_msg=flash_msg,
+                flash_kind=flash_kind,
+            ))
         elif path == "/api/v1/tunnels":
             tunnels = self.state.list()
             self._send_json(200, {"tunnels": tunnels, "count": len(tunnels)})
@@ -641,6 +695,59 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         url = urllib.parse.urlparse(self.path)
         path = url.path.rstrip("/")
+
+        # Dashboard control endpoints (NO AUTH for now — solo management).
+        # Returns HTTP 303 redirect to / after action so the browser
+        # re-renders the dashboard with a flash message.
+        if path == "/dashboard/release":
+            form = self._read_form() or {}
+            token = (form.get("token") or "").strip()
+            if not token:
+                return self._send_json(400, {"error": "token_required"})
+            t = self.state.data["tunnels"].get(token)
+            if not t:
+                return self._dashboard_redirect("Túnel no encontrado (¿ya expiró?)", "err")
+            name = t.get("name", "?")
+            port = t.get("remote_port", "?")
+            res = self.state.release(token)
+            if res.get("ok"):
+                # Also remove the on-demand tunnel user if it exists
+                self._remove_tunnel_user(port)
+                return self._dashboard_redirect(
+                    f"Túnel '{name}' (puerto {port}) borrado", "ok"
+                )
+            return self._dashboard_redirect(f"No se pudo borrar: {res}", "err")
+
+        if path == "/dashboard/extend":
+            form = self._read_form() or {}
+            token = (form.get("token") or "").strip()
+            ttl_str = (form.get("ttl") or "86400").strip()
+            try:
+                ttl = int(ttl_str)
+            except ValueError:
+                ttl = 86400
+            if not token:
+                return self._send_json(400, {"error": "token_required"})
+            t = self.state.data["tunnels"].get(token)
+            if not t:
+                return self._dashboard_redirect("Túnel no encontrado (¿ya expiró?)", "err")
+            # Same logic as /api/v1/tunnels/<tok>/heartbeat but without auth
+            try:
+                now = datetime.datetime.now(datetime.timezone.utc)
+                base = parse_iso_utc(t.get("last_heartbeat")) or now
+                new_exp = base + datetime.timedelta(seconds=ttl)
+                # If already expired or very close, base from now
+                if new_exp < now:
+                    new_exp = now + datetime.timedelta(seconds=ttl)
+                t["expires_at"] = new_exp.strftime("%Y-%m-%dT%H:%M:%SZ")
+                t["last_heartbeat"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+                t["ttl"] = ttl
+                self.state._save()
+                return self._dashboard_redirect(
+                    f"Túnel '{t.get('name','?')}' extendido a {ttl}s", "ok"
+                )
+            except Exception as e:
+                return self._dashboard_redirect(f"Error extendiendo: {e}", "err")
 
         # Auth endpoints (no auth required for /auth/login)
         if path == "/api/v1/auth/login":
@@ -761,7 +868,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 # Dashboard HTML (single-file, dark theme, no JS deps)
 # ----------------------------------------------------------------------------
 
-def render_dashboard(tunnels, port_lo, port_hi) -> str:
+def render_dashboard(tunnels, port_lo, port_hi, flash_msg=None, flash_kind="info"):
     taken = {t["remote_port"] for t in tunnels}
     free = [p for p in range(port_lo, port_hi + 1) if p not in taken]
     now = now_utc()
@@ -780,17 +887,35 @@ def render_dashboard(tunnels, port_lo, port_hi) -> str:
                 ttl_left = f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
             else:
                 ttl_left = f"{secs // 86400}d{(secs % 86400) // 3600:02d}h"
+        token = t.get("token", "")
+        token_short = token[:10] + "…" if token else ""
         rows.append(f"""
         <tr>
-          <td><code>{escape_html(t.get('name',''))}</code></td>
+          <td><code>{escape_html(t.get('name',''))}</code><br><small style="color:#6e7681">{token_short}</small></td>
           <td>{escape_html(t.get('server_alias',''))}</td>
           <td><code>{t.get('remote_port','')}</code></td>
           <td>{escape_html(t.get('protocol',''))}</td>
           <td><code>{escape_html(t.get('egress_ip',''))}</code></td>
           <td>{ttl_left}</td>
           <td><small>{escape_html(t.get('created_at',''))}</small></td>
+          <td class="actions">
+            <form method="POST" action="/dashboard/extend" style="display:inline">
+              <input type="hidden" name="token" value="{escape_html(token)}">
+              <input type="hidden" name="ttl" value="86400">
+              <button type="submit" class="btn btn-extend" title="Extender TTL 24h">+24h</button>
+            </form>
+            <form method="POST" action="/dashboard/release" style="display:inline"
+                  onsubmit="return confirm('¿Borrar túnel {escape_html(t.get('name',''))} (puerto {t.get('remote_port','')})?');">
+              <input type="hidden" name="token" value="{escape_html(token)}">
+              <button type="submit" class="btn btn-danger" title="Borrar túnel">× Borrar</button>
+            </form>
+          </td>
         </tr>""")
-    rows_html = "\n".join(rows) if rows else '<tr><td colspan="7" style="text-align:center;color:#888">no tunnels registered</td></tr>'
+    rows_html = "\n".join(rows) if rows else '<tr><td colspan="8" style="text-align:center;color:#888">no tunnels registered</td></tr>'
+
+    flash_html = ""
+    if flash_msg:
+        flash_html = f'<div class="flash flash-{flash_kind}">{escape_html(flash_msg)}</div>'
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -804,7 +929,7 @@ def render_dashboard(tunnels, port_lo, port_hi) -> str:
   .sub {{ color: #8b949e; font-size: 13px; margin-bottom: 24px; }}
   table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
   th {{ text-align: left; padding: 10px 12px; border-bottom: 1px solid #30363d; color: #58a6ff; font-weight: 600; }}
-  td {{ padding: 10px 12px; border-bottom: 1px solid #21262d; }}
+  td {{ padding: 10px 12px; border-bottom: 1px solid #21262d; vertical-align: middle; }}
   tr:hover td {{ background: #161b22; }}
   code {{ background: #161b22; padding: 2px 6px; border-radius: 4px; color: #d2a8ff; }}
   .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 24px; }}
@@ -813,11 +938,24 @@ def render_dashboard(tunnels, port_lo, port_hi) -> str:
   .card .v {{ font-size: 28px; color: #58a6ff; font-weight: 600; }}
   .footer {{ margin-top: 32px; color: #6e7681; font-size: 12px; text-align: center; }}
   small {{ color: #8b949e; }}
+  td.actions {{ white-space: nowrap; }}
+  .btn {{ background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 4px 10px; font-size: 12px; cursor: pointer; font-family: inherit; }}
+  .btn:hover {{ background: #30363d; }}
+  .btn-danger {{ color: #f85149; border-color: #6e2a2a; }}
+  .btn-danger:hover {{ background: #6e2a2a; color: #fff; }}
+  .btn-extend {{ color: #58a6ff; border-color: #1f4d80; }}
+  .btn-extend:hover {{ background: #1f4d80; color: #fff; }}
+  .flash {{ padding: 12px 16px; border-radius: 6px; margin-bottom: 16px; font-size: 14px; }}
+  .flash-ok {{ background: #0d4429; border: 1px solid #1f6e3e; color: #56d364; }}
+  .flash-err {{ background: #4a0d12; border: 1px solid #8b1a26; color: #ff7b72; }}
+  .flash-info {{ background: #0d2944; border: 1px solid #1f4d80; color: #58a6ff; }}
 </style>
 </head>
 <body>
 <h1>klan1-tunnel dashboard</h1>
 <div class="sub">self-hosted ngrok-like tunnels — refreshed {escape_html(now)}</div>
+
+{flash_html}
 
 <div class="grid">
   <div class="card">
@@ -836,14 +974,14 @@ def render_dashboard(tunnels, port_lo, port_hi) -> str:
 
 <table>
   <thead>
-    <tr><th>Name</th><th>Server</th><th>Port</th><th>Proto</th><th>Egress IP</th><th>TTL</th><th>Created</th></tr>
+    <tr><th>Name</th><th>Server</th><th>Port</th><th>Proto</th><th>Egress IP</th><th>TTL</th><th>Created</th><th>Actions</th></tr>
   </thead>
   <tbody>
     {rows_html}
   </tbody>
 </table>
 
-<div class="footer">klan1-tunnel-server v0.1</div>
+<div class="footer">klan1-tunnel-server v0.2 — dashboard interactivo (sin auth aún)</div>
 </body>
 </html>"""
 
