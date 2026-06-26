@@ -172,8 +172,8 @@ validate_fleet_config() {
         log "python3 not found; cannot validate fleet config"
         return 0
     fi
-    local out
-    if ! out="$(python3 - "$cfg" <<'PYEOF'
+    local out rc=0
+    out="$(python3 - "$cfg" <<'PYEOF'
 import json, sys, re
 placeholders = []
 with open(sys.argv[1]) as f:
@@ -198,11 +198,19 @@ if placeholders:
     sys.exit(1)
 sys.exit(0)
 PYEOF
-)"; then
+)" || rc=$?
+    if [[ $rc -ne 0 ]]; then
         log "fleet config validation FAILED: $FLEET_CONFIG_PATH"
         log "  the file still contains <your-...> placeholders that were never"
         log "  replaced with real values. SSH would fail with"
         log "  \"Bad port '<your-ssh-port>'\" and similar errors."
+        log ""
+        if [[ -n "$out" ]]; then
+            log "  Offending paths:"
+            while IFS= read -r line; do
+                log "    $line"
+            done <<< "$out"
+        fi
         log ""
         log "  Edit $FLEET_CONFIG_PATH and replace every placeholder with a real value."
         log "  See config/fleet.example.json for the schema."
