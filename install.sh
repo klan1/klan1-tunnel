@@ -14,8 +14,8 @@
 #   2. Asks the API for a JWT (device_id=name).
 #   3. Calls /api/v1/tunnels with the JWT; gets back a per-tunnel private key.
 #   4. Installs deps (autossh, klan1-pproxy).
-#   5. Downloads the client to <prefix>/bin/klan1-tunnel-client.
-#   6. Runs the client with --name and --local-port.
+#   5. Downloads klan1-tunnel.sh to <prefix>/bin/klan1-tunnel.
+#   6. Runs the client with --name, --subdomain, --local-port.
 #
 # Requirements: macOS or Linux, network access to api.<base_domain>, Python 3.9+.
 # The device_id must already be on the API whitelist (managed from the dashboard).
@@ -26,7 +26,7 @@ set -uo pipefail
 # Defaults
 # ============================================================================
 KLAN1_REPO_RAW="https://raw.githubusercontent.com/klan1/klan1-tunnel/main"
-KLAN1_CLIENT_BIN="${KLAN1_CLIENT_BIN:-$HOME/.local/bin/klan1-tunnel-client}"
+KLAN1_CLIENT_BIN="${KLAN1_CLIENT_BIN:-$HOME/.local/bin/klan1-tunnel}"
 KLAN1_TUNNEL_HOME="${KLAN1_TUNNEL_HOME:-$HOME/.klan1-tunnel}"
 PREFIX="${PREFIX:-$HOME/.local}"
 
@@ -188,7 +188,7 @@ parse_args() {
             --local-port)  LOCAL_PORT="$2"; shift 2 ;;
             --api-url)     API_URL="$2"; shift 2 ;;
             --fleet)       FLEET_CONFIG_PATH="$2"; shift 2 ;;
-            --prefix)      PREFIX="$2"; KLAN1_CLIENT_BIN="$PREFIX/bin/klan1-tunnel-client"; shift 2 ;;
+            --prefix)      PREFIX="$2"; KLAN1_CLIENT_BIN="$PREFIX/bin/klan1-tunnel"; shift 2 ;;
             --no-start)    NO_START=1; shift ;;
             --skip-deps)   SKIP_DEPS=1; shift ;;
             -h|--help)
@@ -276,7 +276,7 @@ install_client() {
 
     local src=""
     if command -v curl >/dev/null; then
-        if src="$(curl -sSL --max-time 15 "$KLAN1_REPO_RAW/client/klan1-tunnel-client.sh" 2>/dev/null)" \
+        if src="$(curl -sSL --max-time 15 "$KLAN1_REPO_RAW/client/klan1-tunnel.sh" 2>/dev/null)" \
            && [[ -n "$src" && ${#src} -gt 1000 ]]; then
             log "downloaded client from $KLAN1_REPO_RAW"
         else
@@ -377,7 +377,12 @@ print(data.get("private_key", ""))
 # ============================================================================
 start_tunnel() {
     log "starting tunnel name=$NAME subdomain=$SUBDOMAIN port=$LOCAL_PORT -> $SUBDOMAIN_FQDN"
-    if ! "$KLAN1_CLIENT_BIN" --name "$NAME" --local-port "$LOCAL_PORT"; then
+    if ! "$KLAN1_CLIENT_BIN" start \
+        --name "$NAME" \
+        --port "$LOCAL_PORT" \
+        --server primary \
+        --api-url "$API_URL" \
+        --remote-port "$PORT"; then
         die "tunnel start failed. Check ~/.klan1-tunnel/${NAME}.log"
     fi
 }
