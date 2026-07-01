@@ -23,14 +23,60 @@ public URLs.
 
 ## Quick start
 
-### One-liner (any device with `curl` + `bash` + `ssh`)
+`klan1-tunnel` is a **client + server pair**. You run the client on every
+device you want to expose, and the server (`klan1-tunnel-server`)
+allocates a public port and tracks your active tunnels on one of your
+own boxes. Before the client can do anything useful, the server has to
+be installed and your device's `device_id` has to be on its whitelist.
+
+The minimum flags are:
+
+| Flag | What it does |
+|---|---|
+| `--name NAME` | Identifier of this tunnel in the dashboard (e.g. `mac`, `iphone`, `chromebook`) |
+| `--subdomain N` | Which of the 10 pilot slots you want (`1`–`10`); each maps to a fixed remote port (e.g. `1.tunels.klan1.net` → `65081`) |
+
+### First time on a new device — interactive
+
+If `fleet.json` is **not** already on this machine, the installer will
+ask for 5 values (SSH host/user/port, API URL, base domain) over the
+terminal, save them to `~/.config/klan1-tunnel/fleet.json` (mode 600),
+and continue:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/klan1/klan1-tunnel/main/install.sh | \
-    bash -s -- --name mac --server primary
+    bash -s -- --name mac --subdomain 1
 ```
 
-This installs `klan1-tunnel` to `~/.local/bin/` and starts a tunnel named `mac` against `ws1`.
+You'll be prompted for:
+
+```text
+SSH host of the tunnel server [e.g. ai1.example.com]: ai1.klan1.net
+SSH user [j0hnd03]: j0hnd03
+SSH port [22]: 65522
+API base URL [https://api.<base_domain>]: https://api.tunels.klan1.net
+Base domain for subdomains [tunels.klan1.net]: tunels.klan1.net
+```
+
+### Repeat / CI / non-interactive (`curl | bash` over SSH)
+
+If stdin is **not** a TTY (e.g. `curl ... | bash` over SSH), the
+installer will not prompt. Provide a pre-built `fleet.json`:
+
+```bash
+# 1. Build a fleet.json on a box with a TTY (one-time):
+curl -sSL .../install.sh | bash -s -- --name bootstrap --subdomain 1
+
+# 2. Copy the resulting file to the new box:
+scp ~/.config/klan1-tunnel/fleet.json newbox:/tmp/fleet.json
+
+# 3. Then on newbox, run non-interactively:
+curl -sSL .../install.sh | \
+    bash -s -- --name newbox --subdomain 2 --fleet /tmp/fleet.json --non-interactive
+```
+
+Or skip the install start-up entirely with `--no-start` and run
+`klan1-tunnel start` yourself once you've inspected the install.
 
 **Need a deeper walk-through?** See [`INSTALL.md`](./INSTALL.md) — it
 covers the "empty Chromebook" / "no pip" / "no Homebrew" edge cases
@@ -41,8 +87,13 @@ and what to do when the one-liner fails on a fresh box.
 ```bash
 git clone https://github.com/klan1/klan1-tunnel.git
 cd klan1-tunnel/client
-./klan1-tunnel.sh start --name mac --server primary
+./klan1-tunnel.sh start --name mac --subdomain 1 \
+    --api-url https://api.tunels.klan1.net --remote-port 65081
 ```
+
+> The `client/klan1-tunnel.sh` script reads `fleet.json` from
+> `~/.config/klan1-tunnel/fleet.json` or the path given by `--fleet`.
+> The `install.sh` one-liner does the same search.
 
 ## Usage
 
@@ -56,17 +107,28 @@ Actions:
 
 Options for start:
   --name NAME            tunnel name (e.g. mac, iphone, chromebook)
-  --server ALIAS         target server alias (configured in
-                         fleet.json; auto-fallback through server_order)
+  --subdomain N          which of the 10 pilot slots (1..10; maps to
+                         a fixed remote port via fleet.json subdomains)
   --api-url URL          register with the klan1-tunnel-server API
                          (default: from fleet.json → https://<your-api-host>)
   --port PORT            local proxy port (default: same as remote)
-  --remote-port PORT     explicit remote port (default: 65082)
+  --remote-port PORT     explicit remote port (overrides --subdomain)
   --protocol http|socks5 proxy protocol (default: http)
   --no-proxy             tunnel raw TCP (expose a local web server)
   --local-target H:P     target when --no-proxy (default: 127.0.0.1:80)
   --ttl SECONDS          TTL (default: 86400)
   --egress-ip IP         override the detected egress IP
+```
+
+`install.sh` adds these on top:
+
+```text
+  --fleet PATH           path to a pre-built fleet.json (skips interactive prompt)
+  --prefix DIR           where to drop the binary and venv (default: ~/.local)
+  --no-start             install only; do not open the tunnel
+  --skip-deps            don't install system packages
+  --non-interactive      abort with a clear error if fleet.json is missing
+                         (use this under `curl | bash` over SSH)
 ```
 
 ## Architecture
