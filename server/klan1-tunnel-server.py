@@ -1097,9 +1097,9 @@ def render_dashboard(tunnels, port_lo, port_hi, flash_msg=None, flash_kind="info
             </form>
             {ssh_btn}
             <form method="POST" action="/dashboard/release" style="display:inline"
-                  onsubmit="return confirm('¿Borrar túnel {escape_html(t.get('name',''))} (puerto {t.get('remote_port','')})?');">
+                  onsubmit="return confirm('Delete tunnel {escape_html(t.get('name',''))} (port {t.get('remote_port','')})?');">
               <input type="hidden" name="token" value="{escape_html(token)}">
-              <button type="submit" class="btn btn-danger" title="Borrar túnel">× Borrar</button>
+              <button type="submit" class="btn btn-danger" title="Delete tunnel">× Delete</button>
             </form>
           </td>
         </tr>""")
@@ -1143,8 +1143,8 @@ def render_dashboard(tunnels, port_lo, port_hi, flash_msg=None, flash_kind="info
     filter_input = f"""
 <form method="GET" action="/" class="filter-form">
   <input name="q" placeholder="Filter (name, port, ip...)" value="{escape_html(filter_q)}" autofocus>
-  <button type="submit">Filtrar</button>
-  <a href="/" class="btn-link">Limpiar</a>
+  <button type="submit">Filter</button>
+  <a href="/" class="btn-link">Clear</a>
 </form>"""
 
     return f"""<!DOCTYPE html>
@@ -1247,14 +1247,14 @@ def render_dashboard(tunnels, port_lo, port_hi, flash_msg=None, flash_kind="info
 {filter_input}
 
 <form id="bulk-form" method="POST" action="/dashboard/release-bulk"
-      onsubmit="return confirm('¿Borrar los túneles seleccionados?');">
-  onsubmit="return confirm('Delete the selected tunnels?');">
-  <label class="checkbox-cell">
-  <input type="checkbox" onclick="toggleAll(this)" title="Select all">
+      onsubmit="return confirm('Delete the selected tunnels?');">
+  <div class="bulk-bar">
+    <label class="checkbox-cell">
+      <input type="checkbox" onclick="toggleAll(this)" title="Select all">
       <span>Bulk actions</span>
     </label>
-    <button type="submit" class="btn btn-danger">× Borrar seleccionados</button>
-    <span>(selecciona con los checkboxes de la izquierda)</span>
+    <button type="submit" class="btn btn-danger">× Delete selected</button>
+    <span>(select with the checkboxes on the left)</span>
   </div>
 
 <div class="grid">
