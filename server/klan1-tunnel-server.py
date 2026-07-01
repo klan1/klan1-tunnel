@@ -689,6 +689,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             )
         except Exception:
             pass
+        # Also remove the per-tunnel private key (the dashboard/provision path
+        # writes /etc/klan1-tunnel/tunnel-<port>.key; nothing else does).
+        try:
+            for suffix in (".key", ".key.pub"):
+                p = KEYS_BASE / f"{user}{suffix}"
+                if p.exists():
+                    p.unlink()
+        except Exception:
+            pass
 
     # ----- routing -----
     def do_GET(self):
