@@ -114,12 +114,16 @@ You'll be prompted for the 5 values of `fleet.json` (only on the first
 run; subsequent runs on the same box reuse `~/.config/klan1-tunnel/fleet.json`):
 
 ```text
-SSH host of the tunnel server: tunnels.example.com
-SSH user: <your-linux-user>
-SSH port: <your-admin-ssh-port>
-API base URL: https://api.tunnels.example.com
-Base domain for subdomains: tunnels.example.com
+SSH host of the tunnel server: tunnel.example.com
+SSH user: tunnel
+SSH port: 22
+API base URL: https://api.tunnel.example.com
+Base domain for subdomains: tunnel.example.com
 ```
+
+The example values (`tunnel.example.com`, `tunnel`, `22`) are deliberately
+non-routable — replace them with your real infrastructure. They are
+shown here only to illustrate the prompt shape.
 
 The config is saved with mode `0600` so only your user can read it.
 
@@ -225,7 +229,7 @@ python3 -m pip install --user 'klan1-pproxy>=3.0.1'
 # from a Terminal with a TTY):
 curl -sSL https://raw.githubusercontent.com/klan1/klan1-tunnel/main/install.sh | \
     bash -s -- --name mac --subdomain 1 --no-start
-~/.local/bin/klan1-tunnel start --name mac --subdomain 1 --api-url https://api.tunnels.example.com
+~/.local/bin/klan1-tunnel start --name mac --subdomain 1 --api-url https://api.<your-base-domain>
 ```
 
 **Without Homebrew** (rare, but happens on locked-down work Macs):
