@@ -748,6 +748,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if self.auth is None:
                 return self._send_json(503, {"error": "auth_disabled"})
             self._send_json(200, {"devices": self.auth.list_devices()})
+        elif path.startswith("/dashboard/"):
+            # GET on a /dashboard/* action (provision, release, extend, …) means
+            # the browser navigated here by mistake — the action is POST-only.
+            # Redirect to the dashboard root instead of returning JSON 404,
+            # which would otherwise replace the HTML with a raw error blob.
+            return self._dashboard_redirect(
+                f"Esa acción requiere POST: {path}", "info"
+            )
         else:
             self._send_json(404, {"error": "not_found", "path": path})
 
@@ -1152,7 +1160,15 @@ def render_dashboard(tunnels, port_lo, port_hi, flash_msg=None, flash_kind="info
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>klan1-tunnel dashboard</title>
-<meta http-equiv="refresh" content="15">
+<!--
+  No <meta http-equiv="refresh"> here. It nukes:
+    - the user's scroll position
+    - any in-progress copy-paste from a post-provision panel
+    - the focus state of an open <select> / <input>
+  Instead the table body is refreshed by JS (fetch /api/v1/tunnels every
+  15s) so the page chrome and any visible key/ssh-command panels stay put.
+  See the inline <script> at the bottom of this file.
+-->
 <style>
   body {{ font-family: ui-monospace, 'SF Mono', Menlo, monospace; background: #0d1117; color: #c9d1d9; margin: 0; padding: 24px; }}
   h1 {{ color: #58a6ff; margin: 0 0 8px; font-size: 22px; }}
