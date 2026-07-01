@@ -34,6 +34,7 @@ import threading
 import time
 import urllib.parse
 from pathlib import Path
+from typing import Optional
 
 try:
     import jwt  # PyJWT
@@ -593,6 +594,239 @@ class Auth:
         if not device_id or not self.is_device_active(device_id):
             return {"error": "device_revoked"}
         return {"ok": True, "device_id": device_id, "claims": claims}
+
+
+# ----------------------------------------------------------------------------
+# API key model (v2)
+# ----------------------------------------------------------------------------
+# A long-lived credential, independent of any device, that the owner
+# generates from the dashboard and hands to a client. The client uses
+# it once to mint a short-lived JWT, and the JWT is what /provision and
+# /heartbeat actually authenticate with.
+#
+# Storage: only the hash is persisted. The cleartext secret is shown
+# to the user exactly once (at creation time), then discarded — same
+# model as GitHub PATs / AWS access keys.
+#
+# File: <key_dir>/api-keys.json  (mode 0600, owner root)
+# Schema:
+#   {
+#     "keys": {
+#       "<key_id>": {
+#         "id":          "kt1_a1b2c3d4e5f6",   # public, displayed in dashboard
+#         "name":        "macbook install",     # human, owner-supplied
+#         "prefix":      "kt1_",                # identifies the type/version
+#         "hash":        "<bcrypt or pbkdf2>",  # secret is never stored
+#         "hash_algo":   "bcrypt" | "pbkdf2_sha256",
+#         "created_at":  "2026-07-01T18:30:15Z",
+#         "expires_at":  "2026-10-01T18:30:15Z" | null,   # null = never
+#         "revoked_at":  null | "...",
+#         "last_used_at": null | "...",
+#         "tunnels_created": 0
+#       }
+#     }
+#   }
+# ----------------------------------------------------------------------------
+
+try:
+    import bcrypt  # type: ignore
+    HAVE_BCRYPT = True
+except ImportError:
+    HAVE_BCRYPT = False
+
+
+def _hash_secret(secret: str) -> tuple[str, str]:
+    """Return (hash, algo). Uses bcrypt if available, else pbkdf2_sha256."""
+    if HAVE_BCRYPT:
+        # bcrypt has a 72-byte input limit. Take first 72 bytes; that's
+        # more than enough for our 32-char random base62 secret.
+        h = bcrypt.hashpw(secret.encode("utf-8")[:72], bcrypt.gensalt(rounds=12))
+        return h.decode("ascii"), "bcrypt"
+    # Fallback: pbkdf2_sha256 with 200_000 iterations, 32-byte output.
+    import hashlib, secrets
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, 200_000, dklen=32)
+    return f"pbkdf2_sha256$200000${salt.hex()}${dk.hex()}", "pbkdf2_sha256"
+
+
+def _verify_secret(secret: str, stored: str, algo: str) -> bool:
+    if algo == "bcrypt" and HAVE_BCRYPT:
+        try:
+            return bcrypt.checkpw(secret.encode("utf-8")[:72], stored.encode("ascii"))
+        except Exception:
+            return False
+    if algo == "pbkdf2_sha256":
+        import hashlib
+        try:
+            _, iters_s, salt_hex, dk_hex = stored.split("$")
+            iters = int(iters_s)
+            salt = bytes.fromhex(salt_hex)
+            expected = bytes.fromhex(dk_hex)
+            dk = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, iters, dklen=len(expected))
+            # constant-time compare
+            import hmac
+            return hmac.compare_digest(dk, expected)
+        except Exception:
+            return False
+    return False
+
+
+class APIKeyStore:
+    """Long-lived API credentials. Independent of any device."""
+
+    PREFIX = "kt1_"
+    # 22 chars of base62 ≈ 130 bits entropy. Plenty.
+    RANDOM_LEN = 22
+
+    def __init__(self, key_dir: Path):
+        self.key_dir = key_dir
+        self.path = key_dir / "api-keys.json"
+        self._lock = threading.RLock()
+        self._load()
+
+    def _load(self):
+        if self.path.exists():
+            try:
+                self.data = json.loads(self.path.read_text())
+            except Exception:
+                self.data = {"keys": {}}
+        else:
+            self.data = {"keys": {}}
+        if "keys" not in self.data or not isinstance(self.data["keys"], dict):
+            self.data = {"keys": {}}
+
+    def _save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(self.data, indent=2, sort_keys=True))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, self.path)
+        os.chmod(self.path, 0o600)
+
+    @staticmethod
+    def _new_random() -> str:
+        import secrets, string
+        alphabet = string.ascii_letters + string.digits
+        return "".join(secrets.choice(alphabet) for _ in range(APIKeyStore.RANDOM_LEN))
+
+    def create(self, name: str, ttl_seconds: Optional[int] = None) -> dict:
+        """Create a new API key. Returns the cleartext secret in `secret`
+        (one-time display); only the hash is persisted."""
+        with self._lock:
+            key_id = self.PREFIX + self._new_random()
+            secret = self.PREFIX + self._new_random()
+            h, algo = _hash_secret(secret)
+            now = now_utc()
+            exp = None
+            if ttl_seconds is not None and ttl_seconds > 0:
+                from datetime import datetime, timedelta, timezone
+                exp = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
+            self.data["keys"][key_id] = {
+                "id": key_id,
+                "name": name or key_id,
+                "prefix": self.PREFIX,
+                "hash": h,
+                "hash_algo": algo,
+                "created_at": now,
+                "expires_at": exp,
+                "revoked_at": None,
+                "last_used_at": None,
+                "tunnels_created": 0,
+            }
+            self._save()
+            return {
+                "id": key_id,
+                "secret": secret,
+                "name": name or key_id,
+                "prefix": self.PREFIX,
+                "created_at": now,
+                "expires_at": exp,
+            }
+
+    def verify(self, secret: str) -> Optional[dict]:
+        """Look up a key by its cleartext secret. Returns the key record
+        (without the hash) on success, None on failure.
+
+        Constant-time-ish: we walk all keys and try every hash. With
+        <100 keys this is fine; for larger fleets, add an index by
+        prefix (we already have `PREFIX` and could shard by 2 chars)."""
+        if not secret or not secret.startswith(self.PREFIX):
+            return None
+        with self._lock:
+            now_ts = int(time.time())
+            for key_id, rec in self.data["keys"].items():
+                if rec.get("revoked_at"):
+                    continue
+                if not _verify_secret(secret, rec["hash"], rec.get("hash_algo", "bcrypt")):
+                    continue
+                # Check expiry
+                exp = rec.get("expires_at")
+                if exp:
+                    from datetime import datetime, timezone
+                    try:
+                        exp_dt = datetime.strptime(exp, "%Y-%m-%dT%H:%M:%SZ").replace(
+                            tzinfo=timezone.utc
+                        )
+                        if int(exp_dt.timestamp()) < now_ts:
+                            continue
+                    except Exception:
+                        # If the expiry string is malformed, treat the key as
+                        # valid (the owner can re-create it). Failing closed
+                        # here would lock out everyone on a single typo.
+                        pass
+                # Update last_used_at (best-effort, don't fail the verify on write error)
+                rec["last_used_at"] = now_utc()
+                try:
+                    self._save()
+                except Exception:
+                    pass
+                return {k: v for k, v in rec.items() if k != "hash"}
+            return None
+
+    def revoke(self, key_id: str) -> bool:
+        with self._lock:
+            rec = self.data["keys"].get(key_id)
+            if not rec:
+                return False
+            rec["revoked_at"] = now_utc()
+            self._save()
+            return True
+
+    def list(self) -> list:
+        with self._lock:
+            out = []
+            for rec in self.data["keys"].values():
+                out.append({k: v for k, v in rec.items() if k != "hash"})
+            return out
+
+    def is_valid(self, key_id: str) -> bool:
+        """A key is valid if it exists, is not revoked, and not expired."""
+        with self._lock:
+            rec = self.data["keys"].get(key_id)
+            if not rec or rec.get("revoked_at"):
+                return False
+            exp = rec.get("expires_at")
+            if not exp:
+                return True
+            from datetime import datetime, timezone
+            try:
+                exp_dt = datetime.strptime(exp, "%Y-%m-%dT%H:%M:%SZ").replace(
+                    tzinfo=timezone.utc
+                )
+                return int(exp_dt.timestamp()) > int(time.time())
+            except Exception:
+                # If the expiry string is malformed, treat as valid (don't
+                # lock out a key on a typo in expires_at).
+                return True
+
+    def inc_tunnels_created(self, key_id: str) -> None:
+        with self._lock:
+            rec = self.data["keys"].get(key_id)
+            if rec:
+                rec["tunnels_created"] = rec.get("tunnels_created", 0) + 1
+                self._save()
 
 
 # ----------------------------------------------------------------------------
