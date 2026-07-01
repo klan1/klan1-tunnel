@@ -582,6 +582,22 @@ class Auth:
         }
         return jwt.encode(payload, self.priv_pem, algorithm=DEFAULT_JWT_ALGO)
 
+    def issue_token_for_key(self, device_id: str, key_id: str,
+                            key_name: str = "") -> str:
+        """Sign and return a JWT bound to a specific API key.
+
+        Adds a 'key_id' claim so downstream code can verify the key is
+        still valid (not revoked) and trace which key created a tunnel."""
+        now = int(time.time())
+        payload = {
+            "sub": device_id,
+            "name": key_name or device_id,
+            "key_id": key_id,
+            "iat": now,
+            "exp": now + self.ttl,
+        }
+        return jwt.encode(payload, self.priv_pem, algorithm=DEFAULT_JWT_ALGO)
+
     def validate_token(self, token: str) -> dict:
         """Return the claims dict if valid, or an error string."""
         try:
@@ -829,14 +845,38 @@ class APIKeyStore:
                 self._save()
 
 
+def _parse_ttl(s: str) -> Optional[int]:
+    """Parse a human TTL string into seconds. Returns None for "never" or
+    unparseable input. Accepted: "1h", "24h", "7d", "30d", "90d", "1y"."""
+    if not s:
+        return None
+    s = s.strip().lower()
+    if s in ("never", "0", "indefinite"):
+        return None
+    try:
+        if s.endswith("h"):
+            return int(s[:-1]) * 3600
+        if s.endswith("d"):
+            return int(s[:-1]) * 86400
+        if s.endswith("y"):
+            return int(s[:-1]) * 365 * 86400
+        if s.endswith("m") and len(s) > 1 and s[:-1].isdigit():
+            return int(s[:-1]) * 60
+        # bare integer = seconds
+        return int(s)
+    except (ValueError, IndexError):
+        return None
+
+
 # ----------------------------------------------------------------------------
 # HTTP layer
 # ----------------------------------------------------------------------------
 
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "klan1-tunnel-server/0.2"
-    state: State = None  # set by server
-    auth: Auth = None    # set by server (None = auth disabled, all requests pass)
+    state: State = None           # set by server
+    auth: Optional[Auth] = None   # set by server (None = auth disabled, all requests pass)
+    api_keys: Optional[APIKeyStore] = None  # set by server (None = API keys disabled)
 
     def log_message(self, format, *args):
         sys.stderr.write("[%s] %s - %s\n" % (now_utc(), self.address_string(), format % args))
@@ -848,12 +888,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return ("anonymous", None)
         auth_header = self.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
-            return (None, {"error": "missing_auth", "detail": "Authorization: Bearer <jwt> required"})
+            return (None, {"error": "missing_auth", "detail": "Authorization: Bearer *** required"})
         token = auth_header[7:].strip()
         res = self.auth.validate_token(token)
         if "error" in res:
             return (None, res)
         return (res["device_id"], None)
+
+    def _check_basicauth(self) -> bool:
+        """Stub: HTTP Basic auth for the admin endpoints (keys CRUD,
+        dashboard mutations in commit 7). For now this is a TODO that
+        always returns False; the admin endpoints will return 401 until
+        commit 7 wires a real admin user + hashed password.
+
+        The /api/v1/auth/login v2 path (api_key in body) does NOT use
+        this — that path authenticates the client, not the admin."""
+        return False
 
     def _send_json(self, code: int, payload):
         body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
@@ -1131,8 +1181,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send_json(503, {"error": "auth_disabled"})
             data = self._read_json() or {}
             device_id = (data.get("device_id") or "").strip()
+            api_key = (data.get("api_key") or "").strip()
             if not device_id:
                 return self._send_json(400, {"error": "device_id_required"})
+
+            # v2 path: login with an API key. Independent of any device
+            # in the v1 devices.json whitelist — the key is the credential.
+            if api_key:
+                if self.api_keys is None:
+                    return self._send_json(503, {"error": "api_keys_disabled"})
+                rec = self.api_keys.verify(api_key)
+                if not rec:
+                    return self._send_json(401, {"error": "invalid_api_key"})
+                # Re-check validity (revoked/expired) at the auth layer too
+                if not self.api_keys.is_valid(rec["id"]):
+                    return self._send_json(401, {"error": "api_key_revoked"})
+                token = self.auth.issue_token_for_key(
+                    device_id=device_id,
+                    key_id=rec["id"],
+                    key_name=rec.get("name", ""),
+                )
+                return self._send_json(200, {
+                    "ok": True,
+                    "token": token,
+                    "device_id": device_id,
+                    "key_id": rec["id"],
+                    "expires_in": self.auth.ttl,
+                })
+
+            # v1 path: device in devices.json whitelist. Kept for
+            # backwards compat — the existing `mac-hq` tunnel on ai1
+            # still uses this until the v2 cutover.
             if not self.auth.is_device_active(device_id):
                 return self._send_json(403, {"error": "device_not_active"})
             token = self.auth.issue_token(device_id)
@@ -1156,6 +1235,49 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "device_id": device_id,
                 "expires_in": self.auth.ttl,
             })
+
+        # API key management (admin endpoints — basicauth, not JWT).
+        # The dashboard is what calls these; the client never touches
+        # them directly (it uses /api/v1/auth/login with a key, not
+        # creates new ones).
+        if path == "/api/v1/keys" and self.command == "GET":
+            if not self._check_basicauth():
+                return self._send_json(401, {"error": "basicauth_required"})
+            if self.api_keys is None:
+                return self._send_json(503, {"error": "api_keys_disabled"})
+            return self._send_json(200, {"keys": self.api_keys.list()})
+
+        if path == "/api/v1/keys" and self.command == "POST":
+            if not self._check_basicauth():
+                return self._send_json(401, {"error": "basicauth_required"})
+            if self.api_keys is None:
+                return self._send_json(503, {"error": "api_keys_disabled"})
+            data = self._read_json() or {}
+            name = (data.get("name") or "").strip()
+            if not name:
+                return self._send_json(400, {"error": "name_required"})
+            ttl_seconds = data.get("ttl_seconds")
+            # Accept ttl as either seconds (int) or a human string like
+            # "24h", "7d", "30d", "90d", "1y", "never"
+            if isinstance(ttl_seconds, str):
+                ttl_seconds = _parse_ttl(ttl_seconds)
+            if ttl_seconds is not None and (not isinstance(ttl_seconds, int) or ttl_seconds <= 0):
+                return self._send_json(400, {"error": "invalid_ttl"})
+            created = self.api_keys.create(name, ttl_seconds=ttl_seconds)
+            return self._send_json(201, created)
+
+        # DELETE /api/v1/keys/<id>
+        if path.startswith("/api/v1/keys/") and self.command == "DELETE":
+            if not self._check_basicauth():
+                return self._send_json(401, {"error": "basicauth_required"})
+            if self.api_keys is None:
+                return self._send_json(503, {"error": "api_keys_disabled"})
+            key_id = path[len("/api/v1/keys/"):].strip()
+            if not key_id or "/" in key_id:
+                return self._send_json(400, {"error": "invalid_key_id"})
+            if self.api_keys.revoke(key_id):
+                return self._send_json(200, {"ok": True, "key_id": key_id, "revoked": True})
+            return self._send_json(404, {"error": "key_not_found"})
 
         m = re.match(r"^/api/v1/tunnels/([^/]+)/heartbeat$", path)
         if path == "/api/v1/tunnels":
@@ -1579,8 +1701,18 @@ def main():
         except RuntimeError as e:
             print(f"[klan1-tunnel-server] FATAL: {e}", file=sys.stderr)
             sys.exit(2)
+        # API key store is always wired (independent of --no-auth,
+        # because the keys themselves are the auth credential for the
+        # v2 flow). With --no-auth the API endpoints accept everything
+        # anyway, so keys are inert.
+        try:
+            Handler.api_keys = APIKeyStore(Path(args.key_dir))
+        except Exception as e:
+            print(f"[klan1-tunnel-server] FATAL: api-keys init failed: {e}", file=sys.stderr)
+            sys.exit(2)
     else:
         Handler.auth = None
+        Handler.api_keys = None
         print("[klan1-tunnel-server] WARNING: running with --no-auth, all endpoints are public", file=sys.stderr)
 
     # background sweeper
