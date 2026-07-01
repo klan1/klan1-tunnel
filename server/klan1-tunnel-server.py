@@ -142,7 +142,8 @@ SUBDOMAIN_PORTS = {
 # provisions don't trip "cannot lock /etc/group" on a fluke. Also makes
 # the whole provision operation idempotent: if two dashboard clicks
 # race, the second one waits for the first and reuses the result.
-_PROVISION_LOCK = Path("/var/lock/klan1-tunnel-provision.lock")
+# Lives under /tmp because /var/lock may be read-only in containers.
+_PROVISION_LOCK = Path("/tmp/klan1-tunnel-provision.lock")
 TUNNELS_GROUP = "tunnel-users"
 TUNNEL_SHELL = "/usr/local/bin/tunnel-shell.sh"
 KEYS_BASE = Path("/etc/klan1-tunnel")
