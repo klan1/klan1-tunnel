@@ -138,6 +138,11 @@ SUBDOMAIN_PORTS = {
     "1": 65081, "2": 65082, "3": 65083, "4": 65084, "5": 65085,
     "6": 65086, "7": 65087, "8": 65088, "9": 65089, "10": 65090,
 }
+# Serialize all useradd/groupadd calls behind a file lock so concurrent
+# provisions don't trip "cannot lock /etc/group" on a fluke. Also makes
+# the whole provision operation idempotent: if two dashboard clicks
+# race, the second one waits for the first and reuses the result.
+_PROVISION_LOCK = Path("/var/lock/klan1-tunnel-provision.lock")
 TUNNELS_GROUP = "tunnel-users"
 TUNNEL_SHELL = "/usr/local/bin/tunnel-shell.sh"
 KEYS_BASE = Path("/etc/klan1-tunnel")
@@ -180,9 +185,38 @@ def provision_tunnel_user(subdomain: str) -> dict:
       - writes /etc/klan1-tunnel/tunnel-<port>.key (0600 root)
       - writes /home/<user>/.ssh/authorized_keys (0600) with the matching pubkey
     """
+    # Normalize: dashboard may pass int from form.get("subdomain"); the keys
+    # in SUBDOMAIN_PORTS are strings "1".."10". Accept both, but compare as
+    # strings consistently so the lookup never KeyErrors.
+    subdomain = str(subdomain).strip()
     if subdomain not in SUBDOMAIN_PORTS:
-        return {"ok": False, "error": f"invalid_subdomain:{subdomain}"}
+        return {"ok": False, "error": f"invalid_subdomain:{subdomain!r}"}
 
+    # Serialize the whole provision operation behind a file lock so two
+    # concurrent dashboard clicks (or a click during unattended-upgrade)
+    # don't trip the /etc/group lock that useradd holds briefly.  flock
+    # blocks; it does not fail with "cannot lock /etc/group".
+    _PROVISION_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(_PROVISION_LOCK, "w")
+    try:
+        import fcntl
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+    except Exception as e:
+        lock_fd.close()
+        return {"ok": False, "error": f"provision_failed:lock:{e}"}
+
+    try:
+        return _provision_tunnel_user_locked(subdomain)
+    finally:
+        try:
+            import fcntl
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        lock_fd.close()
+
+
+def _provision_tunnel_user_locked(subdomain: str) -> dict:
     port = SUBDOMAIN_PORTS[subdomain]
     user = f"tunnel-{port}"
     user_home = USERS_BASE / user
