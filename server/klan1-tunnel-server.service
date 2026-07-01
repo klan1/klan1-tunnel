@@ -27,7 +27,11 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/lib/klan1-tunnel /etc/klan1-tunnel
+# /var/lib/klan1-tunnel + /etc/klan1-tunnel: tunnel state + per-tunnel keys
+# /etc: useradd/groupadd need to mutate /etc/passwd, /etc/group, /etc/shadow,
+#       /etc/gshadow. With ProtectSystem=strict, those are read-only unless
+#       explicitly listed in ReadWritePaths.
+ReadWritePaths=/var/lib/klan1-tunnel /etc/klan1-tunnel /etc
 
 [Install]
 WantedBy=multi-user.target
