@@ -9,8 +9,12 @@ without Homebrew, etc.).
 > **TL;DR for any Linux box with `sudo` and `curl`:**
 > ```bash
 > curl -sSL https://raw.githubusercontent.com/klan1/klan1-tunnel/main/install.sh | \
->     bash -s -- --name mydevice --server primary
+>     bash -s -- --name mydevice --subdomain 1
 > ```
+> The installer will prompt for the 5 values of `fleet.json` (SSH
+> host/user/port, API URL, base domain) on first run. On a non-TTY
+> pipe (e.g. over SSH), pass `--fleet PATH` to a pre-built config or
+> `--non-interactive` to abort cleanly. See [§1.3](#13-running-the-one-liner).
 
 ## Table of contents
 
@@ -99,21 +103,74 @@ sudo apk add --no-cache python3 py3-pip py3-virtualenv autossh openssh-client cu
 
 Once `python3`, `pip`, and `curl` exist, the one-liner takes over:
 
+**Interactive (TTY available — desktop, laptop, first run on a server):**
+
 ```bash
 curl -sSL https://raw.githubusercontent.com/klan1/klan1-tunnel/main/install.sh | \
-    bash -s -- --name mydevice --server primary
+    bash -s -- --name mydevice --subdomain 1
 ```
 
-Flags:
+You'll be prompted for the 5 values of `fleet.json` (only on the first
+run; subsequent runs on the same box reuse `~/.config/klan1-tunnel/fleet.json`):
+
+```text
+SSH host of the tunnel server: tunnels.example.com
+SSH user: <your-linux-user>
+SSH port: <your-admin-ssh-port>
+API base URL: https://api.tunnels.example.com
+Base domain for subdomains: tunnels.example.com
+```
+
+The config is saved with mode `0600` so only your user can read it.
+
+**Non-interactive (CI, `curl | bash` over SSH, scripts):**
+
+```bash
+# 1. Build fleet.json on a box with a TTY (one-time):
+ssh user@ai1 "curl -sSL .../install.sh | bash -s -- --name bootstrap --subdomain 1"
+scp user@ai1:.config/klan1-tunnel/fleet.json /tmp/fleet.json
+
+# 2. Use it on the target box:
+curl -sSL .../install.sh | \
+    bash -s -- --name newbox --subdomain 2 --fleet /tmp/fleet.json --non-interactive
+```
+
+**Install only (no auto-start) — useful for inspecting what landed:**
+
+```bash
+curl -sSL .../install.sh | \
+    bash -s -- --name mydevice --subdomain 1 --no-start
+~/.local/bin/klan1-tunnel start --name mydevice --subdomain 1
+```
+
+Flags (for `install.sh`):
 
 | Flag | What it does | Default |
 |---|---|---|
 | `--name NAME` | Identifier of this tunnel in the dashboard | `$(hostname -s)` |
-| `--server ALIAS` | Target server alias (must be defined in your `fleet.json`) | first in `server_order` |
+| `--subdomain N` | Which of the 10 pilot slots (`1`–`10`); picks a fixed remote port | **required** |
+| `--fleet PATH` | Use a pre-built `fleet.json` (skip interactive prompt) | search in 3 standard locations |
+| `--non-interactive` | Abort with a clear error if `fleet.json` is missing (use under `curl \| bash` over SSH) | off (prompt if needed) |
 | `--prefix DIR` | Where to drop `klan1-tunnel` and the venv | `~/.local` |
 | `--no-start` | Install only; do not open the tunnel | off |
 | `--skip-deps` | Don't `apt install` (you did it manually) | off |
-| `--skip-key`  | Don't generate an SSH key | off |
+
+The installer searches for `fleet.json` in this order, using the first
+one it finds:
+
+1. `--fleet PATH` (if given)
+2. `~/.config/klan1-tunnel/fleet.json`
+3. `~/.klan1-tunnel/fleet.json`
+4. `/etc/klan1-tunnel/fleet.json`
+
+If none of those exist and `--non-interactive` was passed, the installer
+aborts with `refusing to prompt. Pass --fleet PATH.` Otherwise it asks
+the 5 questions above and writes a fresh config to
+`~/.config/klan1-tunnel/fleet.json` (mode `0600`).
+
+The installer also fail-fasts if `fleet.json` still contains any
+`<your-...>` placeholder — better than letting `ssh` return
+`Bad port <your-ssh-port>` 30 seconds later.
 
 ### 1.4 What the one-liner does (and where things go)
 
@@ -163,7 +220,12 @@ The dashboard at the API URL from your fleet config also lists it.
 ```bash
 brew install autossh
 python3 -m pip install --user 'klan1-pproxy>=3.0.1'
-~/.local/bin/klan1-tunnel start --name mac --server primary
+# Make sure ~/.config/klan1-tunnel/fleet.json exists (the installer
+# writes it; on macOS the only way to get it is the interactive one-liner
+# from a Terminal with a TTY):
+curl -sSL https://raw.githubusercontent.com/klan1/klan1-tunnel/main/install.sh | \
+    bash -s -- --name mac --subdomain 1 --no-start
+~/.local/bin/klan1-tunnel start --name mac --subdomain 1 --api-url https://api.tunnels.example.com
 ```
 
 **Without Homebrew** (rare, but happens on locked-down work Macs):
@@ -184,7 +246,7 @@ python3 -m pip install --user 'klan1-pproxy>=3.0.1'
    for a one-shot test it works:
 
    ```bash
-   ~/.local/bin/klan1-tunnel start --name mac --server primary --no-autossh
+   ~/.local/bin/klan1-tunnel start --name mac --subdomain 1 --no-autossh
    ```
 
    (Verify whether your client version actually has this flag; if not,
@@ -228,7 +290,7 @@ The first-time install (copy-paste in the Crostini terminal):
 sudo apt update
 sudo apt install -y python3 python3-pip python3-venv autossh openssh-client curl
 curl -sSL https://raw.githubusercontent.com/klan1/klan1-tunnel/main/install.sh | \
-    bash -s -- --name chromebook --server primary
+    bash -s -- --name chromebook --subdomain 1
 ```
 
 > **If your Chromebook is a managed/enterprise device** that does not
@@ -253,7 +315,7 @@ The recovery path:
 
    ```bash
    curl -sSL .../install.sh | \
-       bash -s -- --name mydevice --server primary --skip-deps
+       bash -s -- --name mydevice --subdomain 1 --skip-deps
    ```
 
 2. **The venv path is fully user-owned**, so the rest of the
