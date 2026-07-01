@@ -128,11 +128,11 @@ build_fleet_config() {
     echo
 
     local ssh_host ssh_user ssh_port api_url base_domain
-    prompt_var "Primary tunnel server hostname or IP" ssh_host "ai1"
-    prompt_var "SSH user on the primary server"     ssh_user "j0hnd03"
+    prompt_var "Primary tunnel server hostname or IP" ssh_host "tunnel.example.com"
+    prompt_var "SSH user on the primary server"     ssh_user "tunnel"
     prompt_var "SSH port on the primary server"      ssh_port "22"
-    prompt_var "API base URL (https://...)"          api_url  "https://api.tunels.klan1.net"
-    prompt_var "Base domain for tunnel hostnames"    base_domain "tunels.klan1.net"
+    prompt_var "API base URL (https://...)"          api_url  "https://api.tunnel.example.com"
+    prompt_var "Base domain for tunnel hostnames"    base_domain "tunnel.example.com"
 
     mkdir -p "$(dirname "$target")"
     chmod 700 "$(dirname "$target")"

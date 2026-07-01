@@ -34,7 +34,7 @@ The minimum flags are:
 | Flag | What it does |
 |---|---|
 | `--name NAME` | Identifier of this tunnel in the dashboard (e.g. `mac`, `iphone`, `chromebook`) |
-| `--subdomain N` | Which of the 10 pilot slots you want (`1`–`10`); each maps to a fixed remote port (e.g. `1.tunels.klan1.net` → `65081`) |
+| `--subdomain N` | Which of the 10 pilot slots you want (`1`–`10`); each maps to a fixed remote port (e.g. `1.<your-base-domain>` → `65081`) |
 
 ### First time on a new device — interactive
 
@@ -51,12 +51,18 @@ curl -sSL https://raw.githubusercontent.com/klan1/klan1-tunnel/main/install.sh |
 You'll be prompted for:
 
 ```text
-SSH host of the tunnel server [e.g. ai1.example.com]: ai1.klan1.net
-SSH user [j0hnd03]: j0hnd03
-SSH port [22]: 65522
-API base URL [https://api.<base_domain>]: https://api.tunels.klan1.net
-Base domain for subdomains [tunels.klan1.net]: tunels.klan1.net
+SSH host of the tunnel server: tunnel.example.com
+SSH user: tunnel
+SSH port: 22
+API base URL: https://api.tunnel.example.com
+Base domain for subdomains: tunnel.example.com
 ```
+
+The prompts accept defaults (in brackets `[...]` if shown by the
+installer), and you can press Enter to use them — but **always replace
+the example values** (`example.com`, `tunnel`, `22`) with your real
+infrastructure. The defaults shown in the repo are deliberately
+non-routable.
 
 ### Repeat / CI / non-interactive (`curl | bash` over SSH)
 
@@ -88,7 +94,7 @@ and what to do when the one-liner fails on a fresh box.
 git clone https://github.com/klan1/klan1-tunnel.git
 cd klan1-tunnel/client
 ./klan1-tunnel.sh start --name mac --subdomain 1 \
-    --api-url https://api.tunels.klan1.net --remote-port 65081
+    --api-url https://api.<your-base-domain> --remote-port 65081
 ```
 
 > The `client/klan1-tunnel.sh` script reads `fleet.json` from

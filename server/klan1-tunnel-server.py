@@ -754,7 +754,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Redirect to the dashboard root instead of returning JSON 404,
             # which would otherwise replace the HTML with a raw error blob.
             return self._dashboard_redirect(
-                f"Esa acción requiere POST: {path}", "info"
+                f"Action requires POST: {path}", "info"
             )
         else:
             self._send_json(404, {"error": "not_found", "path": path})
@@ -779,33 +779,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 local_port = 8080
 
             if not name:
-                return self._dashboard_redirect("Name es requerido", "err")
+                return self._dashboard_redirect("Name is required", "err")
             if proto not in ("http", "socks5", "tcp"):
                 proto = "http"
             try:
                 subdomain = int(subdomain_str) if subdomain_str else None
             except ValueError:
-                return self._dashboard_redirect(f"Subdomain inválido: {subdomain_str}", "err")
+                return self._dashboard_redirect(f"Invalid subdomain: {subdomain_str}", "err")
 
             if subdomain is None:
-                return self._dashboard_redirect("Subdomain es requerido", "err")
+                return self._dashboard_redirect("Subdomain is required", "err")
 
             try:
                 prov = provision_tunnel_user(str(subdomain))
                 if not prov.get("ok"):
                     return self._dashboard_redirect(
-                        f"No se pudo provisionar tunnel-{prov.get('port','?')}: {prov.get('error')}",
+                        f"Could not provision tunnel-{prov.get('port','?')}: {prov.get('error')}",
                         "err",
                     )
                 rport = prov["port"]
                 tunnel_user = prov["user"]
                 private_key = prov["private_key"]
             except Exception as e:
-                return self._dashboard_redirect(f"Exception en provision: {e}", "err")
+                return self._dashboard_redirect(f"Exception during provision: {e}", "err")
 
             res = self.state.reserve(name, rport, proto, "primary", "dashboard", 86400)
             if not res.get("ok"):
-                return self._dashboard_redirect(f"No se pudo reservar: {res}", "err")
+                return self._dashboard_redirect(f"Could not reserve: {res}", "err")
 
             token = res["token"]
             ssh_cmd = (
@@ -819,7 +819,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.state.list(),
                 self.state.port_lo,
                 self.state.port_hi,
-                flash_msg=f"Túnel '{name}' creado en https://{fqdn} — copia la SSH key ABAJO",
+                flash_msg=f"Tunnel '{name}' created at https://{fqdn} — copy the SSH key BELOW",
                 flash_kind="ok",
                 private_key_for_token=private_key,
                 ssh_command_for_token=ssh_cmd,
@@ -831,7 +831,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if isinstance(tokens, str):
                 tokens = [tokens]
             if not tokens:
-                return self._dashboard_redirect("Ningún túnel seleccionado", "err")
+                return self._dashboard_redirect("No tunnels selected", "err")
             deleted = 0
             for tok in tokens:
                 tok = tok.strip()
@@ -845,7 +845,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         deleted += 1
                         self._remove_tunnel_user(port)
             return self._dashboard_redirect(
-                f"{deleted} túnel(es) borrado(s)", "ok" if deleted else "err"
+                f"{deleted} tunnel(s) deleted", "ok" if deleted else "err"
             )
 
         if path == "/dashboard/release":
@@ -855,7 +855,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send_json(400, {"error": "token_required"})
             t = self.state.data["tunnels"].get(token)
             if not t:
-                return self._dashboard_redirect("Túnel no encontrado (¿ya expiró?)", "err")
+                return self._dashboard_redirect("Tunnel not found (already expired?)", "err")
             name = t.get("name", "?")
             port = t.get("remote_port", "?")
             res = self.state.release(token)
@@ -863,9 +863,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # Also remove the on-demand tunnel user if it exists
                 self._remove_tunnel_user(port)
                 return self._dashboard_redirect(
-                    f"Túnel '{name}' (puerto {port}) borrado", "ok"
+                    f"Tunnel '{name}' (port {port}) deleted", "ok"
                 )
-            return self._dashboard_redirect(f"No se pudo borrar: {res}", "err")
+            return self._dashboard_redirect(f"Could not delete: {res}", "err")
 
         if path == "/dashboard/extend":
             form = self._read_form() or {}
@@ -879,24 +879,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send_json(400, {"error": "token_required"})
             t = self.state.data["tunnels"].get(token)
             if not t:
-                return self._dashboard_redirect("Túnel no encontrado (¿ya expiró?)", "err")
+                return self._dashboard_redirect("Tunnel not found (already expired?)", "err")
             # Same logic as /api/v1/tunnels/<tok>/heartbeat but without auth
             try:
-                now = datetime.datetime.now(datetime.timezone.utc)
-                base = parse_iso_utc(t.get("last_heartbeat")) or now
-                new_exp = base + datetime.timedelta(seconds=ttl)
-                # If already expired or very close, base from now
-                if new_exp < now:
-                    new_exp = now + datetime.timedelta(seconds=ttl)
-                t["expires_at"] = new_exp.strftime("%Y-%m-%dT%H:%M:%SZ")
-                t["last_heartbeat"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-                t["ttl"] = ttl
-                self.state._save()
+                result = self.state.heartbeat(token, extend_ttl=ttl)
+                new_exp = result.get("expires_at", "?")
                 return self._dashboard_redirect(
-                    f"Túnel '{t.get('name','?')}' extendido a {ttl}s", "ok"
+                    f"Tunnel '{t.get('name','?')}' extended to {ttl}s (expires {new_exp})",
+                    "ok",
                 )
             except Exception as e:
-                return self._dashboard_redirect(f"Error extendiendo: {e}", "err")
+                return self._dashboard_redirect(f"Error extending: {e}", "err")
 
         # Auth endpoints (no auth required for /auth/login)
         if path == "/api/v1/auth/login":
@@ -1129,7 +1122,7 @@ def render_dashboard(tunnels, port_lo, port_hi, flash_msg=None, flash_kind="info
     # Provision form
     provision_form = f"""
 <div class="provision-card">
-  <h2>Crear nuevo túnel</h2>
+  <h2>Create new tunnel</h2>
   <form method="POST" action="/dashboard/provision" class="provision-form">
     <label>Name (device) <input name="name" required placeholder="macbook"></label>
     <label>Subdomain #
@@ -1149,7 +1142,7 @@ def render_dashboard(tunnels, port_lo, port_hi, flash_msg=None, flash_kind="info
 
     filter_input = f"""
 <form method="GET" action="/" class="filter-form">
-  <input name="q" placeholder="Filtrar (name, port, ip...)" value="{escape_html(filter_q)}" autofocus>
+  <input name="q" placeholder="Filter (name, port, ip...)" value="{escape_html(filter_q)}" autofocus>
   <button type="submit">Filtrar</button>
   <a href="/" class="btn-link">Limpiar</a>
 </form>"""
@@ -1230,7 +1223,7 @@ def render_dashboard(tunnels, port_lo, port_hi, flash_msg=None, flash_kind="info
       .then(d => {{
         if (d.error) {{ alert('Error: ' + d.error); return; }}
         const cmd = 'ssh -i ~/.klan1-tunnel/id_ed25519_' + d.user + ' -N -T -R ' + d.port + ':127.0.0.1:' + (d.local_port || 8080) + ' ' + d.user + '@' + d.host;
-        prompt('Copia este comando y correlo en tu máquina:', cmd);
+        prompt('Copy this command and run it on your machine:', cmd);
       }})
       .catch(e => alert('Fetch failed: ' + e));
   }}
@@ -1255,9 +1248,9 @@ def render_dashboard(tunnels, port_lo, port_hi, flash_msg=None, flash_kind="info
 
 <form id="bulk-form" method="POST" action="/dashboard/release-bulk"
       onsubmit="return confirm('¿Borrar los túneles seleccionados?');">
-  <div class="bulk-bar">
-    <label class="checkbox-cell">
-      <input type="checkbox" onclick="toggleAll(this)" title="Seleccionar todos">
+  onsubmit="return confirm('Delete the selected tunnels?');">
+  <label class="checkbox-cell">
+  <input type="checkbox" onclick="toggleAll(this)" title="Select all">
       <span>Bulk actions</span>
     </label>
     <button type="submit" class="btn btn-danger">× Borrar seleccionados</button>
