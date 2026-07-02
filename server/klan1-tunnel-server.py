@@ -358,14 +358,35 @@ class State:
         self.default_ttl = default_ttl
         self._lock = threading.RLock()
         self.data = {"tunnels": {}, "ports_reserved": []}
+        self._mtime = 0.0  # last-loaded mtime of state.json (for _maybe_reload)
         self._load()
         # sweep expired on startup
         self._sweep_expired()
+
+    def _maybe_reload(self):
+        """Reload state from disk if the file's mtime changed.
+
+        Symmetric to APIKeyStore._maybe_reload. Allows external
+        processes (e.g. a test harness, or a future admin tool) to
+        modify state.json and have the server pick up the changes on
+        the next read. Without this, the in-memory copy gets stale
+        and the sweeper misses changes made directly to the file.
+        """
+        try:
+            if not self.path.exists():
+                return
+            mtime = self.path.stat().st_mtime
+            if mtime > self._mtime:
+                self._load()
+                self._mtime = mtime
+        except OSError:
+            pass
 
     def _load(self):
         if self.path.exists():
             try:
                 self.data = json.loads(self.path.read_text())
+                self._mtime = self.path.stat().st_mtime
                 if "tunnels" not in self.data:
                     self.data["tunnels"] = {}
                 if "ports_reserved" not in self.data:
@@ -377,6 +398,8 @@ class State:
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.data, indent=2, sort_keys=True))
         tmp.replace(self.path)
+        # Update cached mtime so our own write doesn't immediately re-read
+        self._mtime = self.path.stat().st_mtime
 
     def _sweep_expired(self):
         """Remove tunnels whose expires_at has passed. Also remove
@@ -392,6 +415,9 @@ class State:
         Idempotent: safe to call repeatedly. Returns the list of
         (token, name, port) tuples that were removed (useful for
         logging and tests)."""
+        # Reload in case someone wrote directly to state.json
+        # since the last _save (e.g. a test patching expires_at).
+        self._maybe_reload()
         with self._lock:
             now = datetime.datetime.now(datetime.timezone.utc)
             expired = []
@@ -423,6 +449,7 @@ class State:
         list of (token, name, port) tuples removed."""
         if api_keys is None:
             return []
+        self._maybe_reload()
         with self._lock:
             to_remove = []
             for tok, t in list(self.data["tunnels"].items()):
