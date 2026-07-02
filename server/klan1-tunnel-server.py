@@ -48,6 +48,15 @@ DEFAULT_PORT_RANGE_END = 65300
 DEFAULT_TTL_SECONDS = 86400  # 24h
 DEFAULT_JWT_TTL_SECONDS = 30 * 24 * 3600  # 30 days
 DEFAULT_JWT_ALGO = "RS256"
+
+# Caddy integration. The server regenerates the klan1-tunnel slice of
+# the Caddy config on every provision/release. The Caddyfile in /etc/caddy/
+# imports this file (added in commit 9) so the running Caddy picks up
+# changes via `caddy reload` (graceful, zero-downtime).
+CADDY_BIN = "/usr/bin/caddy"
+CADDY_TUNNELS_PATH = Path("/etc/caddy/Caddyfile.klan1-tunnel")
+CADDY_DNS_TOKEN_PATH = Path("/etc/klan1-tunnel/caddy-dns-token")  # not committed
+CADDY_DNS_PROVIDER = "cloudflare"
 # Base domain for tunnel subdomains. Override per-deployment via the
 # /etc/klan1-tunnel/fleet.json file (see config/fleet.example.json).
 DEFAULT_BASE_DOMAIN = "tunnels.<your-domain>"
@@ -1029,15 +1038,152 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception:
             pass
 
-    def _caddy_reload_for_tunnel(self, device_id: str, port: int, op: str) -> bool:
-        """STUB for commit 4. Returns True if Caddy was reloaded (or
-        there's nothing to do); False if the reload failed.
+    # ----- Caddy integration (commit 4) -----
 
-        For now this just logs and returns True, so the provision flow
-        doesn't get blocked while commit 4 wires the real generator +
-        dry-run + reload logic."""
-        print(f"[caddy] (stub) {op} vhost for {device_id}.<base> -> 127.0.0.1:{port}", file=sys.stderr)
-        return True
+    def _read_caddy_dns_token(self) -> Optional[str]:
+        """Read the Cloudflare DNS token used by the Caddy tls.dns block.
+
+        The token is stored at CADDY_DNS_TOKEN_PATH (mode 0600) so it
+        doesn't have to live in this script. Return None if the file
+        is missing — in that case the generated Caddyfile will use a
+        placeholder and `caddy validate` will fail with a clear message."""
+        try:
+            if not CADDY_DNS_TOKEN_PATH.exists():
+                return None
+            return CADDY_DNS_TOKEN_PATH.read_text().strip() or None
+        except OSError as e:
+            print(f"[caddy] could not read DNS token: {e}", file=sys.stderr)
+            return None
+
+    def generate_caddyfile(self, tunnels: list) -> str:
+        """Build the klan1-tunnel slice of the Caddyfile from the
+        current tunnel list. One vhost per active tunnel:
+
+            <device_id>.<base_domain> {
+                tls { dns cloudflare <token> }
+                reverse_proxy 127.0.0.1:<port>
+            }
+
+        Returns a full Caddyfile (not a fragment) so `caddy validate`
+        can be run on it standalone. The shape is the same that the
+        v1 hardcoded block had, just dynamic."""
+        token = self._read_caddy_dns_token()
+        if not token:
+            token = "<no-token-set>"  # validate will catch this
+        parts = []
+        parts.append("# klan1-tunnel Caddyfile slice — DO NOT EDIT BY HAND")
+        parts.append("# Regenerated automatically on every provision/release.")
+        parts.append("# This file is `import`-ed by /etc/caddy/Caddyfile.")
+        parts.append("")
+        for t in tunnels:
+            name = t.get("name")
+            port = t.get("remote_port")
+            if not name or not port:
+                continue
+            fqdn = f"{name}.{BASE_DOMAIN}"
+            parts.append(f"{fqdn} {{")
+            parts.append(f"    tls {{")
+            parts.append(f"        dns {CADDY_DNS_PROVIDER} {token}")
+            parts.append(f"    }}")
+            parts.append(f"    reverse_proxy 127.0.0.1:{port}")
+            parts.append(f"}}")
+            parts.append("")
+        return "\n".join(parts)
+
+    def _caddy_validate(self, content: str) -> tuple:
+        """Run `caddy validate --config <tmpfile>`. Returns (ok, stderr).
+
+        Uses a temp file because caddy validate wants a path, not stdin."""
+        import tempfile
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".Caddyfile", delete=False, dir="/tmp"
+            ) as f:
+                f.write(content)
+                tmp = f.name
+            r = subprocess.run(
+                [CADDY_BIN, "validate", "--config", tmp],
+                capture_output=True, text=True, timeout=15,
+            )
+            return (r.returncode == 0, r.stderr or r.stdout)
+        except subprocess.TimeoutExpired:
+            return (False, "caddy validate timed out")
+        except Exception as e:
+            return (False, f"caddy validate error: {e}")
+        finally:
+            if tmp:
+                try:
+                    Path(tmp).unlink()
+                except OSError:
+                    pass
+
+    def _caddy_reload(self, content: str) -> tuple:
+        """Write content to CADDY_TUNNELS_PATH, run caddy validate against
+        the FULL Caddyfile, then caddy reload. Returns (ok, message).
+
+        Strategy: do not touch the main Caddyfile from here. Just write
+        the slice and reload the main Caddyfile (which is what
+        `caddy reload --config <main>` does). The main Caddyfile is
+        expected to `import` our slice (commit 9 will add that line).
+        Until then, the reload sees the unchanged main Caddyfile and
+        no harm done.
+
+        If `caddy validate --config <main>` fails, abort before reload."""
+        try:
+            CADDY_TUNNELS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            # Atomic write: write to .tmp, then rename
+            tmp = CADDY_TUNNELS_PATH.with_suffix(".tmp")
+            tmp.write_text(content)
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, CADDY_TUNNELS_PATH)
+        except OSError as e:
+            return (False, f"write {CADDY_TUNNELS_PATH} failed: {e}")
+
+        # Validate the full main Caddyfile (which will import our slice
+        # once commit 9 adds the import line). Until then, this just
+        # validates the unchanged main.
+        main_caddyfile = Path("/etc/caddy/Caddyfile")
+        if not main_caddyfile.exists():
+            return (True, f"wrote {CADDY_TUNNELS_PATH} (no main Caddyfile to validate)")
+        r = subprocess.run(
+            [CADDY_BIN, "validate", "--config", str(main_caddyfile)],
+            capture_output=True, text=True, timeout=20,
+        )
+        if r.returncode != 0:
+            return (False, f"caddy validate main: {r.stderr or r.stdout}")
+
+        # Reload
+        r = subprocess.run(
+            [CADDY_BIN, "reload", "--config", str(main_caddyfile)],
+            capture_output=True, text=True, timeout=20,
+        )
+        if r.returncode != 0:
+            return (False, f"caddy reload: {r.stderr or r.stdout}")
+        return (True, "reloaded")
+
+    def _caddy_reload_for_tunnel(self, device_id: str, port: int, op: str) -> bool:
+        """Regenerate the klan1-tunnel Caddyfile slice from current
+        state and reload Caddy. Returns True on success.
+
+        Called after every provision (op='add') and release (op='remove',
+        from commit 5's sweeper). The function name is a misnomer now
+        (it doesn't reload for a single tunnel — it reloads for the
+        whole set), but the signature is stable for callers."""
+        try:
+            tunnels = self.state.list()
+            content = self.generate_caddyfile(tunnels)
+            ok, msg = self._caddy_reload(content)
+            if not ok:
+                print(f"[caddy] reload failed after {op} of {device_id}:{port}: {msg}",
+                      file=sys.stderr)
+            else:
+                print(f"[caddy] reloaded after {op} of {device_id}:{port} "
+                      f"({len(tunnels)} active vhost(s))", file=sys.stderr)
+            return ok
+        except Exception as e:
+            print(f"[caddy] exception in _caddy_reload_for_tunnel: {e}", file=sys.stderr)
+            return False
 
     def _provision_v2_user(self, port: int, device_id: str) -> dict:
         """v2 provision: same user+key+home+authorized_keys dance as the
