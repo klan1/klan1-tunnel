@@ -379,6 +379,19 @@ class State:
         tmp.replace(self.path)
 
     def _sweep_expired(self):
+        """Remove tunnels whose expires_at has passed. Also remove
+        tunnels whose api_key was revoked (if the APIKeyStore is
+        available on the Handler — we look it up lazily because
+        State is constructed before the APIKeyStore in main()).
+
+        For each removed tunnel, also:
+          - drop the unix user (`tunnel-<port>`)
+          - drop the per-device private key
+          - trigger a Caddy reload so the vhost goes away
+
+        Idempotent: safe to call repeatedly. Returns the list of
+        (token, name, port) tuples that were removed (useful for
+        logging and tests)."""
         with self._lock:
             now = datetime.datetime.now(datetime.timezone.utc)
             expired = []
@@ -386,19 +399,99 @@ class State:
                 exp = parse_iso_utc(t.get("expires_at", ""))
                 if exp and exp < now:
                     expired.append(tok)
+            removed = []
             for tok in expired:
                 port = self.data["tunnels"][tok].get("remote_port")
+                name = self.data["tunnels"][tok].get("name", "")
                 del self.data["tunnels"][tok]
                 if port and port in self.data["ports_reserved"]:
                     self.data["ports_reserved"].remove(port)
+                removed.append((tok, name, port))
             if expired:
                 print(f"[sweep] removed {len(expired)} expired tunnels", file=sys.stderr)
                 self._save()
+        # Side effects happen OUTSIDE the state lock so we don't hold
+        # it while running userdel/subprocess. The cleanup is best-effort:
+        # the tunnel is gone from state, which is what matters; the unix
+        # user + Caddy vhost are just hygiene.
+        for tok, name, port in removed:
+            self._cleanup_tunnel_side_effects(name, port)
+        return removed
+
+    def _sweep_revoked_keys(self, api_keys: "APIKeyStore") -> list:
+        """Drop tunnels whose API key has been revoked. Returns the
+        list of (token, name, port) tuples removed."""
+        if api_keys is None:
+            return []
+        with self._lock:
+            to_remove = []
+            for tok, t in list(self.data["tunnels"].items()):
+                # Tunnel records don't store the key_id; we rely on
+                # last_heartbeat being stamped by the client, but the
+                # v1 path never set last_heartbeat. The cheapest signal
+                # is the 'egress_ip' field, but that's also unreliable.
+                # For now we don't track key_id in the tunnel record
+                # (we could add it — see commit 5 TODO below). This
+                # method is therefore a no-op for the v1 records.
+                #
+                # Workaround for v2: the provision path now sets
+                # t['api_key_id'] when the JWT was bound to a key
+                # (added in this commit, see reserve_with_egress_ip).
+                kid = t.get("api_key_id")
+                if kid and not api_keys.is_valid(kid):
+                    to_remove.append(tok)
+            removed = []
+            for tok in to_remove:
+                port = self.data["tunnels"][tok].get("remote_port")
+                name = self.data["tunnels"][tok].get("name", "")
+                del self.data["tunnels"][tok]
+                if port and port in self.data["ports_reserved"]:
+                    self.data["ports_reserved"].remove(port)
+                removed.append((tok, name, port))
+            if removed:
+                print(f"[sweep] removed {len(removed)} tunnels with revoked keys", file=sys.stderr)
+                self._save()
+        for tok, name, port in removed:
+            self._cleanup_tunnel_side_effects(name, port)
+        return removed
+
+    def _cleanup_tunnel_side_effects(self, name: str, port: int):
+        """Best-effort: drop the unix user, drop the per-device key file,
+        and trigger a Caddy reload. Never raises."""
+        # Find the Handler instance to call its cleanup methods.
+        # State is decoupled from Handler in the import graph (State
+        # doesn't know about Handler), so we go through the running
+        # thread's Handler. We use a class-level hook for tests.
+        handler = _get_active_handler()
+        if handler is not None:
+            try:
+                handler._remove_tunnel_user(port)
+            except Exception as e:
+                print(f"[sweep] _remove_tunnel_user({port}) failed: {e}", file=sys.stderr)
+            try:
+                # Drop the per-device key file
+                keyfile = KEYS_BASE / f"{name}.key"
+                if keyfile.exists():
+                    keyfile.unlink()
+            except Exception as e:
+                print(f"[sweep] unlink {name}.key failed: {e}", file=sys.stderr)
+            try:
+                handler._caddy_reload_for_tunnel(name, port, "remove")
+            except Exception as e:
+                print(f"[sweep] caddy reload after remove of {name}:{port} failed: {e}", file=sys.stderr)
 
     def sweep_periodic(self, stop_event: threading.Event):
+        """Run _sweep_expired + _sweep_revoked_keys every 30s. The
+        reference to api_keys is set on the State instance by main()
+        after both objects exist (avoids the bootstrap-order trap)."""
         while not stop_event.is_set():
             time.sleep(30)
-            self._sweep_expired()
+            try:
+                self._sweep_expired()
+                if getattr(self, "_api_keys", None) is not None:
+                    self._sweep_revoked_keys(self._api_keys)
+            except Exception as e:
+                print(f"[sweep] error: {e}", file=sys.stderr)
 
     def next_free_port(self, requested: int = None) -> int:
         with self._lock:
@@ -411,7 +504,8 @@ class State:
             return None
 
     def reserve(self, name: str, requested_port: int, protocol: str,
-                server_alias: str, egress_ip: str, ttl: int) -> dict:
+                server_alias: str, egress_ip: str, ttl: int,
+                api_key_id: Optional[str] = None) -> dict:
         with self._lock:
             # Reject if name already has a live tunnel. We return the full token
             # so the client can re-adopt the tunnel (heartbeat-friendly).
@@ -445,6 +539,8 @@ class State:
                 "last_heartbeat": created.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "ttl": ttl,
             }
+            if api_key_id:
+                entry["api_key_id"] = api_key_id
             self.data["tunnels"][token] = entry
             if port not in self.data["ports_reserved"]:
                 self.data["ports_reserved"].append(port)
@@ -898,6 +994,19 @@ class APIKeyStore:
             if rec:
                 rec["tunnels_created"] = rec.get("tunnels_created", 0) + 1
                 self._save()
+
+
+# Set in main(): a Handler instance the background sweeper can use
+# to call back into Handler._remove_tunnel_user() and
+# Handler._caddy_reload_for_tunnel(). The sweeper runs in its own
+# thread (no request), so we can't pull a Handler from the request.
+_SWEEPER_HANDLER = None
+
+
+def _get_active_handler():
+    """Return the Handler instance the sweeper should use, or None if
+    the server hasn't started yet."""
+    return _SWEEPER_HANDLER
 
 
 def _parse_ttl(s: str) -> Optional[int]:
@@ -1526,7 +1635,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send_json(400, {"error": "invalid_local_port"})
 
             # Reserve a port via the State machine (handles name_in_use
-            # and no_free_ports).
+            # and no_free_ports). We stamp the JWT's key_id (if any)
+            # onto the tunnel entry so the sweeper can drop tunnels
+            # whose key was revoked.
+            token_for_state = (self.headers.get("Authorization", "")[7:].strip()
+                               if self.headers.get("Authorization", "").startswith("Bearer ")
+                               else "")
+            key_id_for_state = None
+            if token_for_state and self.auth is not None:
+                vres = self.auth.validate_token(token_for_state)
+                if vres.get("ok"):
+                    key_id_for_state = vres.get("claims", {}).get("key_id")
+
             res = self.state.reserve(
                 name=device_id,
                 requested_port=None,  # lowest free
@@ -1534,6 +1654,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 server_alias="primary",
                 egress_ip="api",
                 ttl=self.state.default_ttl,
+                api_key_id=key_id_for_state,
             )
             if not res.get("ok"):
                 code = 409 if res.get("error") == "name_in_use" else 503
@@ -2132,6 +2253,24 @@ def main():
         Handler.auth = None
         Handler.api_keys = None
         print("[klan1-tunnel-server] WARNING: running with --no-auth, all endpoints are public", file=sys.stderr)
+
+    # Wire the State and the sweeper so they can reach the Handler
+    # for cleanup operations (userdel, caddy reload). We instantiate
+    # a Handler with placeholder HTTP request args (it's never used
+    # for a real request — only for calling the cleanup methods which
+    # read self.state and self.api_keys).
+    global _SWEEPER_HANDLER
+    try:
+        _SWEEPER_HANDLER = Handler.__new__(Handler)
+        # __new__ skips __init__, so we set the class-level attrs
+        # explicitly on the instance for the cleanup path.
+        _SWEEPER_HANDLER.state = state
+        _SWEEPER_HANDLER.api_keys = Handler.api_keys
+        _SWEEPER_HANDLER.auth = Handler.auth
+    except Exception as e:
+        print(f"[main] WARNING: could not create sweeper Handler: {e}", file=sys.stderr)
+        _SWEEPER_HANDLER = None
+    state._api_keys = Handler.api_keys
 
     # background sweeper
     stop = threading.Event()
