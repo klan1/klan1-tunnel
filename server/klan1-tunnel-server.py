@@ -1060,6 +1060,65 @@ def _parse_ttl(s: str) -> Optional[int]:
 
 
 # ----------------------------------------------------------------------------
+# Dashboard basicauth (commit 7)
+# ----------------------------------------------------------------------------
+# Admin endpoints (/api/v1/keys CRUD, force-release) are protected by
+# HTTP Basic auth. The admin users live in
+# /etc/klan1-tunnel/dashboard-auth.json:
+#   {"users": {"admin": {"password_bcrypt": "$2b$..."}}}
+# If the file is missing on first boot, the server generates a random
+# password for the 'admin' user, prints it to stderr (one-time), and
+# saves the file. The owner is expected to change the password
+# afterwards (the file is mode 0600 so the password hash is private).
+DASHBOARD_AUTH_PATH = Path("/etc/klan1-tunnel/dashboard-auth.json")
+_DASHBOARD_USERS: dict = {}
+
+
+def _load_dashboard_users():
+    """Read /etc/klan1-tunnel/dashboard-auth.json. If the file doesn't
+    exist, generate a fresh 'admin' user with a random password and
+    write the file. Returns the users dict (also stored in the module
+    global _DASHBOARD_USERS for the handler to read)."""
+    global _DASHBOARD_USERS
+    if DASHBOARD_AUTH_PATH.exists():
+        try:
+            data = json.loads(DASHBOARD_AUTH_PATH.read_text())
+            users = data.get("users", {})
+            _DASHBOARD_USERS = users
+            return users
+        except Exception as e:
+            print(f"[admin] could not load {DASHBOARD_AUTH_PATH}: {e}", file=sys.stderr)
+            _DASHBOARD_USERS = {}
+            return {}
+    # First boot: generate a random password for the 'admin' user
+    if not HAVE_BCRYPT:
+        print("[admin] FATAL: bcrypt not available, cannot create admin user",
+              file=sys.stderr)
+        _DASHBOARD_USERS = {}
+        return {}
+    import secrets, string
+    alphabet = string.ascii_letters + string.digits
+    random_pw = "".join(secrets.choice(alphabet) for _ in range(24))
+    salt = bcrypt.gensalt(rounds=10)
+    hashed = bcrypt.hashpw(random_pw.encode("utf-8"), salt).decode("ascii")
+    DASHBOARD_AUTH_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"users": {"admin": {"password_bcrypt": hashed}}}
+    DASHBOARD_AUTH_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    os.chmod(DASHBOARD_AUTH_PATH, 0o600)
+    print("=" * 70, file=sys.stderr)
+    print("[admin] FIRST BOOT: generated admin user.", file=sys.stderr)
+    print(f"[admin]   username: admin", file=sys.stderr)
+    print(f"[admin]   password: {random_pw}", file=sys.stderr)
+    print(f"[admin]   saved to: {DASHBOARD_AUTH_PATH} (mode 0600)", file=sys.stderr)
+    print("[admin]   CHANGE THIS PASSWORD if you want to keep using this",
+          file=sys.stderr)
+    print("[admin]   server. To rotate, edit the password_bcrypt field.", file=sys.stderr)
+    print("=" * 70, file=sys.stderr)
+    _DASHBOARD_USERS = payload["users"]
+    return _DASHBOARD_USERS
+
+
+# ----------------------------------------------------------------------------
 # HTTP layer
 # ----------------------------------------------------------------------------
 
@@ -1087,14 +1146,49 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return (res["device_id"], None)
 
     def _check_basicauth(self) -> bool:
-        """Stub: HTTP Basic auth for the admin endpoints (keys CRUD,
-        dashboard mutations in commit 7). For now this is a TODO that
-        always returns False; the admin endpoints will return 401 until
-        commit 7 wires a real admin user + hashed password.
+        """HTTP Basic auth for the admin endpoints (keys CRUD, dashboard
+        mutations). Reads users from /etc/klan1-tunnel/dashboard-auth.json
+        (mode 0600). If the file is missing or malformed, returns False
+        and the admin endpoints 401.
 
         The /api/v1/auth/login v2 path (api_key in body) does NOT use
         this — that path authenticates the client, not the admin."""
-        return False
+        if self.auth is None:
+            # Auth disabled (--no-auth) → admin endpoints also disabled.
+            # We let them through with a warning rather than 401-ing
+            # forever in local dev mode.
+            return True
+        auth_header = self.headers.get("Authorization", "")
+        if not auth_header.startswith("Basic "):
+            return False
+        import base64
+        try:
+            encoded = auth_header[6:].strip()
+            decoded = base64.b64decode(encoded).decode("utf-8", "replace")
+            username, _, password = decoded.partition(":")
+        except Exception:
+            return False
+        if not username or not password:
+            return False
+        # Look up the user
+        users = _DASHBOARD_USERS  # global, refreshed by main()
+        rec = users.get(username)
+        if not rec:
+            return False
+        stored = rec.get("password_bcrypt", "")
+        if not stored:
+            return False
+        if not HAVE_BCRYPT:
+            # bcrypt is required for basicauth; without it we can't
+            # verify. Fail closed.
+            print("[admin] bcrypt not available; basicauth disabled",
+                  file=sys.stderr)
+            return False
+        try:
+            return bcrypt.checkpw(password.encode("utf-8")[:72],
+                                   stored.encode("ascii"))
+        except Exception:
+            return False
 
     def _send_json(self, code: int, payload):
         body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
@@ -1436,6 +1530,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = url.path.rstrip("/") or "/"
         if path == "/healthz":
             self._send_json(200, {"ok": True, "time": now_utc()})
+        elif path == "/dashboard/admin":
+            # Admin page: API keys + devices. Requires basicauth.
+            # If basicauth fails, send a 401 with WWW-Authenticate
+            # so the browser pops the auth dialog.
+            if not self._check_basicauth():
+                self.send_response(401)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("WWW-Authenticate", 'Basic realm="klan1-tunnel admin"')
+                self.end_headers()
+                self.wfile.write(b"401 basicauth required\n")
+                return
+            self._send_html(200, render_admin_page(
+                self.api_keys.list() if self.api_keys else [],
+                self.state.list(),
+                self.state.port_lo, self.state.port_hi,
+            ))
         elif path == "/":
             # Parse query string for flash + filter
             query = urllib.parse.parse_qs(url.query)
@@ -2158,7 +2268,7 @@ def render_dashboard(tunnels, port_lo, port_hi, flash_msg=None, flash_kind="info
 </head>
 <body>
 <h1>klan1-tunnel dashboard</h1>
-<div class="sub">self-hosted ngrok-like tunnels — refreshed {escape_html(now)} — auto-refresh 15s</div>
+<div class="sub">self-hosted ngrok-like tunnels — refreshed {escape_html(now)} — auto-refresh 15s — <a href="/dashboard/admin" class="nav">admin</a></div>
 
 {flash_html}
 
@@ -2205,6 +2315,193 @@ def render_dashboard(tunnels, port_lo, port_hi, flash_msg=None, flash_kind="info
 </form>
 
 <div class="footer">klan1-tunnel-server v0.3 — dashboard interactivo + auto-refresh + filter + bulk + provision</div>
+</body>
+</html>"""
+
+
+def render_admin_page(api_keys, tunnels, port_lo, port_hi):
+    """Render the admin page: list API keys + devices, with forms
+    to create/revoke keys. Requires HTTP Basic auth (the caller
+    already checked).
+
+    Uses a tiny bit of fetch() JS for create/revoke. No external
+    dependencies; the auth header is reused from the page (the
+    browser caches the Basic credentials per-realm)."""
+    now = now_utc()
+    key_rows = []
+    for k in api_keys:
+        kid = escape_html(k.get("id", ""))
+        name = escape_html(k.get("name", ""))
+        created = escape_html(k.get("created_at", ""))
+        expires = escape_html(k.get("expires_at", ""))
+        revoked = k.get("revoked_at")
+        last_used = k.get("last_used_at") or "-"
+        tunnels_created = k.get("tunnels_created", 0)
+        status = "REVOKED" if revoked else ("active" if k.get("expires_at") else "active (no expiry)")
+        if revoked:
+            status_html = f'<span class="revoked">{status}</span>'
+        else:
+            status_html = f'<span class="active">{status}</span>'
+        revoke_btn = (f'<button class="btn btn-danger" onclick="revokeKey(\'{kid}\')">× Revoke</button>'
+                      if not revoked else '<span class="muted">—</span>')
+        key_rows.append(f"""
+    <tr>
+      <td><code>{kid}</code></td>
+      <td>{name}</td>
+      <td>{status_html}</td>
+      <td>{created}</td>
+      <td>{expires or '—'}</td>
+      <td>{last_used}</td>
+      <td>{tunnels_created}</td>
+      <td>{revoke_btn}</td>
+    </tr>""")
+
+    dev_rows = []
+    for t in tunnels:
+        name = escape_html(t.get("name", ""))
+        port = t.get("remote_port", "")
+        token = escape_html(t.get("token", ""))
+        kid = escape_html(t.get("api_key_id", "—"))
+        created = escape_html(t.get("created_at", ""))
+        expires = escape_html(t.get("expires_at", ""))
+        dev_rows.append(f"""
+    <tr>
+      <td><code>{name}</code></td>
+      <td>{port}</td>
+      <td><code class="small">{token[:16]}...</code></td>
+      <td><code class="small">{kid}</code></td>
+      <td>{created}</td>
+      <td>{expires}</td>
+    </tr>""")
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>klan1-tunnel admin</title>
+<style>
+  body {{ font-family: -apple-system, system-ui, sans-serif; margin: 24px; max-width: 1280px; }}
+  h1 {{ margin-bottom: 8px; }}
+  .sub {{ color: #888; font-size: 14px; margin-bottom: 16px; }}
+  h2 {{ margin-top: 32px; border-bottom: 1px solid #ddd; padding-bottom: 6px; }}
+  table {{ width: 100%; border-collapse: collapse; margin-top: 12px; }}
+  th, td {{ padding: 8px 10px; text-align: left; border-bottom: 1px solid #eee; font-size: 14px; }}
+  th {{ background: #f5f5f5; font-weight: 600; }}
+  code {{ font-family: 'SF Mono', Menlo, monospace; font-size: 13px; }}
+  code.small {{ font-size: 11px; color: #666; }}
+  .btn {{ background: #2c7be5; color: white; border: 0; padding: 6px 12px;
+         border-radius: 4px; cursor: pointer; font-size: 13px; }}
+  .btn:hover {{ background: #1a68d1; }}
+  .btn-danger {{ background: #c0392b; }}
+  .btn-danger:hover {{ background: #a82817; }}
+  .revoked {{ color: #c0392b; font-weight: 600; }}
+  .active {{ color: #28a745; font-weight: 600; }}
+  .muted {{ color: #aaa; }}
+  .new-key {{ background: #fff3cd; padding: 12px; border-radius: 6px;
+              margin: 12px 0; display: none; }}
+  .new-key code {{ background: #fff; padding: 4px 6px; border-radius: 3px; display: inline-block; }}
+  .flash {{ background: #d4edda; color: #155724; padding: 8px 12px;
+            border-radius: 4px; margin: 12px 0; display: none; }}
+  .flash.err {{ background: #f8d7da; color: #721c24; }}
+  form.create {{ display: flex; gap: 8px; align-items: end; margin: 12px 0; }}
+  form.create input, form.create select {{ padding: 6px 8px; border: 1px solid #ccc;
+                                            border-radius: 4px; font-size: 14px; }}
+  form.create label {{ display: flex; flex-direction: column; font-size: 12px;
+                       color: #666; }}
+  a.nav {{ color: #2c7be5; text-decoration: none; font-size: 14px; }}
+</style>
+</head>
+<body>
+<a href="/" class="nav">← Back to tunnels</a>
+<h1>klan1-tunnel admin</h1>
+<div class="sub">self-hosted admin panel — {escape_html(now)}</div>
+
+<div class="flash" id="flash"></div>
+
+<h2>API keys</h2>
+<form class="create" onsubmit="return createKey(event)">
+  <label>Name <input type="text" id="k-name" required placeholder="e.g. work-laptop"></label>
+  <label>TTL
+    <select id="k-ttl">
+      <option value="24h">24 hours</option>
+      <option value="7d">7 days</option>
+      <option value="30d" selected>30 days</option>
+      <option value="90d">90 days</option>
+      <option value="1y">1 year</option>
+      <option value="never">never</option>
+    </select>
+  </label>
+  <button type="submit" class="btn">+ Create key</button>
+</form>
+
+<div class="new-key" id="new-key">
+  <strong>New key created.</strong> Copy the secret now — it will not be shown again.
+  <br><br>
+  Key ID: <code id="new-kid"></code><br>
+  Secret: <code id="new-secret"></code>
+</div>
+
+<table>
+  <thead>
+    <tr><th>ID</th><th>Name</th><th>Status</th><th>Created</th><th>Expires</th>
+        <th>Last used</th><th>Tunnels</th><th>Action</th></tr>
+  </thead>
+  <tbody>
+    {''.join(key_rows) if key_rows else '<tr><td colspan="8" class="muted">No keys yet. Create one above.</td></tr>'}
+  </tbody>
+</table>
+
+<h2>Active devices</h2>
+<table>
+  <thead>
+    <tr><th>Name (device_id)</th><th>Port</th><th>Token</th>
+        <th>Created by API key</th><th>Created</th><th>Expires</th></tr>
+  </thead>
+  <tbody>
+    {''.join(dev_rows) if dev_rows else '<tr><td colspan="6" class="muted">No active devices.</td></tr>'}
+  </tbody>
+</table>
+
+<p class="sub" style="margin-top:32px">
+  Port range: {port_lo}-{port_hi} — {len(tunnels)} of {port_hi - port_lo + 1} ports used.
+</p>
+
+<script>
+async function createKey(ev) {{
+  ev.preventDefault();
+  const name = document.getElementById('k-name').value;
+  const ttl  = document.getElementById('k-ttl').value;
+  const r = await fetch('/api/v1/keys', {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify({{ name, ttl_seconds: ttl }})
+  }});
+  const data = await r.json();
+  if (!r.ok) {{ showFlash('Error: ' + (data.error || r.statusText), true); return false; }}
+  document.getElementById('new-kid').textContent = data.id;
+  document.getElementById('new-secret').textContent = data.secret;
+  document.getElementById('new-key').style.display = 'block';
+  showFlash('Key ' + data.id + ' created. Copy the secret above — it won\\'t show again.', false);
+  setTimeout(() => location.reload(), 200);
+  return false;
+}}
+async function revokeKey(kid) {{
+  if (!confirm('Revoke API key ' + kid + '? Tunnels created by it will be swept.')) return;
+  const r = await fetch('/api/v1/keys/' + encodeURIComponent(kid), {{
+    method: 'DELETE',
+  }});
+  const data = await r.json().catch(() => ({{}}));
+  if (!r.ok) {{ showFlash('Error: ' + (data.error || r.statusText), true); return; }}
+  showFlash('Key ' + kid + ' revoked.', false);
+  setTimeout(() => location.reload(), 200);
+}}
+function showFlash(msg, isErr) {{
+  const f = document.getElementById('flash');
+  f.textContent = msg;
+  f.className = 'flash' + (isErr ? ' err' : '');
+  f.style.display = 'block';
+}}
+</script>
 </body>
 </html>"""
 
@@ -2280,6 +2577,11 @@ def main():
         Handler.auth = None
         Handler.api_keys = None
         print("[klan1-tunnel-server] WARNING: running with --no-auth, all endpoints are public", file=sys.stderr)
+
+    # Load dashboard admin users. Always run so the file gets
+    # created on first boot (even with --no-auth, since the dashboard
+    # login form still wants a real password).
+    _load_dashboard_users()
 
     # Wire the State and the sweeper so they can reach the Handler
     # for cleanup operations (userdel, caddy reload). We instantiate
