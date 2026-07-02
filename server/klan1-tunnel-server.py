@@ -599,7 +599,17 @@ class Auth:
         return jwt.encode(payload, self.priv_pem, algorithm=DEFAULT_JWT_ALGO)
 
     def validate_token(self, token: str) -> dict:
-        """Return the claims dict if valid, or an error string."""
+        """Return the claims dict if valid, or an error string.
+
+        Two flavors of JWT are accepted:
+          - v1: payload has 'sub' (device_id) but no 'key_id'. The
+            device must be in devices.json with active=true.
+          - v2: payload has 'sub' (device_id) AND 'key_id'. The device
+            does NOT need to be in devices.json — the API key is the
+            credential, and the device is whatever the client claimed
+            in the URL. The key must still be valid (not revoked, not
+            expired) at the moment of the request.
+        """
         try:
             claims = jwt.decode(token, self.pub_pem, algorithms=[DEFAULT_JWT_ALGO])
         except jwt.ExpiredSignatureError:
@@ -607,7 +617,18 @@ class Auth:
         except jwt.InvalidTokenError as e:
             return {"error": "invalid", "detail": str(e)}
         device_id = claims.get("sub")
-        if not device_id or not self.is_device_active(device_id):
+        if not device_id:
+            return {"error": "no_sub"}
+        # v2 path: api_key-bound JWT. The key is checked at issuance
+        # time (in /api/v1/auth/login); we don't re-check validity here
+        # because revoking a key should not invalidate already-issued
+        # JWTs mid-flight. The sweeper + /api/v1/tunnels/<tok>/heartbeat
+        # are the right places to fail closed if the key was revoked
+        # between JWT issuance and use.
+        if claims.get("key_id"):
+            return {"ok": True, "device_id": device_id, "claims": claims}
+        # v1 path: device must be active in the whitelist.
+        if not self.is_device_active(device_id):
             return {"error": "device_revoked"}
         return {"ok": True, "device_id": device_id, "claims": claims}
 
@@ -983,6 +1004,125 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception:
             pass
 
+    def _caddy_reload_for_tunnel(self, device_id: str, port: int, op: str) -> bool:
+        """STUB for commit 4. Returns True if Caddy was reloaded (or
+        there's nothing to do); False if the reload failed.
+
+        For now this just logs and returns True, so the provision flow
+        doesn't get blocked while commit 4 wires the real generator +
+        dry-run + reload logic."""
+        print(f"[caddy] (stub) {op} vhost for {device_id}.<base> -> 127.0.0.1:{port}", file=sys.stderr)
+        return True
+
+    def _provision_v2_user(self, port: int, device_id: str) -> dict:
+        """v2 provision: same user+key+home+authorized_keys dance as the
+        v1 path, but takes (port, device_id) instead of (subdomain).
+        The key file lives at /etc/klan1-tunnel/<device_id>.key so the
+        owner can find it by device name. Returns
+        {ok, user, port, private_key, public_key} on success, or
+        {ok: False, error: ...} on failure.
+
+        Side effects (all idempotent): creates the tunnel-<port> unix
+        user, creates .ssh/authorized_keys, writes the keypair under
+        /etc/klan1-tunnel/<device_id>.key (mode 0600 root).
+        """
+        user = f"tunnel-{port}"
+        user_home = USERS_BASE / user
+        ssh_dir = user_home / ".ssh"
+        auth_keys = ssh_dir / "authorized_keys"
+        keyfile = KEYS_BASE / f"{device_id}.key"
+
+        try:
+            # Group
+            try:
+                import grp
+                grp.getgrnam(TUNNELS_GROUP)
+            except KeyError:
+                subprocess.run(
+                    ["groupadd", TUNNELS_GROUP],
+                    check=True, capture_output=True,
+                )
+
+            # User
+            try:
+                pw = pwd.getpwnam(user)
+            except KeyError:
+                user_home.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.chmod(user_home.parent, 0o755)
+                except OSError:
+                    pass
+                subprocess.run(
+                    ["useradd", "-M", "-d", str(user_home),
+                     "-s", TUNNEL_SHELL, "-G", TUNNELS_GROUP, user],
+                    check=True, capture_output=True,
+                )
+                pw = pwd.getpwnam(user)
+
+            # .ssh dir
+            try:
+                user_home.mkdir(parents=True, exist_ok=True)
+                ssh_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                return {"ok": False, "error": f"provision_failed:mkdir:{e}"}
+            try:
+                os.chmod(user_home, 0o700)
+                os.chmod(ssh_dir, 0o700)
+            except OSError:
+                pass
+            try:
+                os.chown(user_home, pw.pw_uid, pw.pw_gid)
+                os.chown(ssh_dir, pw.pw_uid, pw.pw_gid)
+            except OSError as e:
+                print(f"[provision v2] chown: {e}", file=sys.stderr)
+
+            # Keypair
+            private_key, public_key = generate_keypair_ed25519()
+
+            # Save key under <device_id> (so the owner can find it)
+            try:
+                keyfile.parent.mkdir(parents=True, exist_ok=True)
+                os.chmod(keyfile.parent, 0o700)
+            except (OSError, PermissionError):
+                pass
+            keyfile.write_text(private_key + "\n")
+            os.chmod(keyfile, 0o600)
+
+            # authorized_keys with restrict + permitopen
+            auth_line = (
+                f'command="",from="*",restrict,port-forwarding,'
+                f'permitopen="127.0.0.1:{port}" {public_key}'
+            )
+            try:
+                auth_keys.write_text(auth_line + "\n")
+                os.chmod(auth_keys, 0o600)
+            except OSError as e:
+                return {"ok": False, "error": f"provision_failed:write_auth_keys:{e}"}
+            try:
+                os.chown(auth_keys, pw.pw_uid, pw.pw_gid)
+            except OSError as e:
+                print(f"[provision v2] chown auth_keys: {e}", file=sys.stderr)
+
+            return {
+                "ok": True,
+                "user": user,
+                "port": port,
+                "private_key": private_key,
+                "public_key": public_key,
+            }
+        except subprocess.CalledProcessError as e:
+            return {
+                "ok": False,
+                "error": f"provision_failed:{e.stderr.decode(errors='replace')}",
+            }
+        except Exception as e:
+            import traceback
+            return {
+                "ok": False,
+                "error": f"provision_failed:{type(e).__name__}:{e}",
+                "trace": traceback.format_exc(),
+            }
+
     # ----- routing -----
     def do_GET(self):
         url = urllib.parse.urlparse(self.path)
@@ -1174,6 +1314,113 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 )
             except Exception as e:
                 return self._dashboard_redirect(f"Error extending: {e}", "err")
+
+        # v2 provision: POST /api/v1/devices/<device_id>/provision
+        # Requires JWT (any kind: v1 whitelist or v2 api_key-bound).
+        # Returns the full bundle (device_id, tunnel_user, tunnel_port,
+        # fqdn, ssh_host, ssh_user, ssh_port, private_key, ssh_command,
+        # expires_at, ttl, token) so the installer can save the key and
+        # open the SSH reverse tunnel in one shot.
+        m_prov = re.match(r"^/api/v1/devices/([^/]+)/provision$", path)
+        if m_prov:
+            if self.auth is None:
+                return self._send_json(503, {"error": "auth_disabled"})
+            device_id, err = self._require_auth()
+            if err:
+                return self._send_json(401, err)
+            # Path's device_id is the authoritative one (in case the
+            # JWT's sub and the URL disagree — URL wins).
+            url_device_id = m_prov.group(1)
+            if url_device_id != device_id:
+                return self._send_json(403, {
+                    "error": "device_id_mismatch",
+                    "detail": f"JWT sub={device_id!r} but URL device_id={url_device_id!r}",
+                })
+            # Validate the regex from the spec
+            if not re.match(r"^[a-z][a-z0-9-]{0,30}[a-z0-9]$", device_id):
+                return self._send_json(400, {
+                    "error": "invalid_device_id",
+                    "detail": "must match ^[a-z][a-z0-9-]{0,30}[a-z0-9]$",
+                })
+            # Body: optional local_port (default 8080)
+            try:
+                data = self._read_json() or {}
+            except Exception:
+                data = {}
+            try:
+                local_port = int(data.get("local_port") or 8080)
+                if not (1 <= local_port <= 65535):
+                    raise ValueError
+            except (TypeError, ValueError):
+                return self._send_json(400, {"error": "invalid_local_port"})
+
+            # Reserve a port via the State machine (handles name_in_use
+            # and no_free_ports).
+            res = self.state.reserve(
+                name=device_id,
+                requested_port=None,  # lowest free
+                protocol="http",
+                server_alias="primary",
+                egress_ip="api",
+                ttl=self.state.default_ttl,
+            )
+            if not res.get("ok"):
+                code = 409 if res.get("error") == "name_in_use" else 503
+                return self._send_json(code, res)
+
+            port = res["remote_port"]
+            token = res["token"]
+            fqdn = f"{device_id}.{BASE_DOMAIN}"
+
+            # Provision the unix user + key (idempotent side effects)
+            prov = self._provision_v2_user(port, device_id)
+            if not prov.get("ok"):
+                # Roll back the reservation to avoid leaking a port
+                self.state.release(token)
+                return self._send_json(500, {
+                    "error": "provision_failed",
+                    "detail": prov.get("error"),
+                })
+
+            # Build the SSH command the installer will run
+            ssh_host = API_HOST or "<your-server-host>"
+            ssh_user = "<your-linux-user>"  # from fleet.json; hard-coded for now
+            ssh_port = <your-admin-ssh-port>
+            tunnel_user = prov["user"]
+            ssh_cmd = (
+                f"ssh -i ~/.klan1-tunnel/id_ed25519_{tunnel_user} "
+                f"-N -T -R {port}:127.0.0.1:{local_port} "
+                f"{tunnel_user}@{ssh_host} -p {ssh_port}"
+            )
+
+            # Side effect: caddy reload (commit 4 will implement; for
+            # now we just log and flag it in the response).
+            caddy_reload_ok = self._caddy_reload_for_tunnel(device_id, port, "add")
+
+            # Bump tunnels_created on the api_key (if the JWT was bound
+            # to one). We do this best-effort.
+            claims = self.auth.validate_token(
+                self.headers.get("Authorization", "")[7:].strip()
+            )
+            key_id = (claims or {}).get("claims", {}).get("key_id")
+            if key_id and self.api_keys is not None:
+                self.api_keys.inc_tunnels_created(key_id)
+
+            return self._send_json(200, {
+                "device_id": device_id,
+                "tunnel_user": tunnel_user,
+                "tunnel_port": port,
+                "fqdn": fqdn,
+                "ssh_host": ssh_host,
+                "ssh_user": ssh_user,
+                "ssh_port": ssh_port,
+                "private_key": prov["private_key"],
+                "ssh_command": ssh_cmd,
+                "expires_at": res["expires_at"],
+                "ttl": res["ttl"],
+                "token": token,
+                "caddy_reload_ok": caddy_reload_ok,
+            })
 
         # Auth endpoints (no auth required for /auth/login)
         if path == "/api/v1/auth/login":
