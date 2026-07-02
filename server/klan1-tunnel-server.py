@@ -1589,6 +1589,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if self.auth is None:
                 return self._send_json(503, {"error": "auth_disabled"})
             self._send_json(200, {"devices": self.auth.list_devices()})
+        elif path == "/api/v1/keys":
+            # GET /api/v1/keys — list API keys (admin, basicauth).
+            if not self._check_basicauth():
+                return self._send_json(401, {"error": "basicauth_required"})
+            if self.api_keys is None:
+                return self._send_json(503, {"error": "api_keys_disabled"})
+            self._send_json(200, {"keys": self.api_keys.list()})
         elif path.startswith("/dashboard/"):
             # GET on a /dashboard/* action (provision, release, extend, …) means
             # the browser navigated here by mistake — the action is POST-only.
@@ -1916,12 +1923,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # The dashboard is what calls these; the client never touches
         # them directly (it uses /api/v1/auth/login with a key, not
         # creates new ones).
-        if path == "/api/v1/keys" and self.command == "GET":
-            if not self._check_basicauth():
-                return self._send_json(401, {"error": "basicauth_required"})
-            if self.api_keys is None:
-                return self._send_json(503, {"error": "api_keys_disabled"})
-            return self._send_json(200, {"keys": self.api_keys.list()})
+        # Note: the GET /api/v1/keys handler lives in do_GET, not here.
 
         if path == "/api/v1/keys" and self.command == "POST":
             if not self._check_basicauth():
