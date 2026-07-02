@@ -719,12 +719,32 @@ class APIKeyStore:
         self.key_dir = key_dir
         self.path = key_dir / "api-keys.json"
         self._lock = threading.RLock()
+        self._mtime = 0.0  # last-loaded mtime of the on-disk file
         self._load()
+
+    def _maybe_reload(self):
+        """Reload from disk if the file's mtime changed.
+
+        This handles the case where an admin process (e.g. the dashboard
+        or a separate `python3 -c` script) modifies api-keys.json while
+        the server is running. Without this, the server's in-memory
+        copy gets stale and verify() / list() return wrong data.
+        """
+        try:
+            if not self.path.exists():
+                return
+            mtime = self.path.stat().st_mtime
+            if mtime > self._mtime:
+                self._load()
+                self._mtime = mtime
+        except OSError:
+            pass
 
     def _load(self):
         if self.path.exists():
             try:
                 self.data = json.loads(self.path.read_text())
+                self._mtime = self.path.stat().st_mtime
             except Exception:
                 self.data = {"keys": {}}
         else:
@@ -739,6 +759,8 @@ class APIKeyStore:
         os.chmod(tmp, 0o600)
         os.replace(tmp, self.path)
         os.chmod(self.path, 0o600)
+        # Update our cached mtime so we don't immediately re-read our own write
+        self._mtime = self.path.stat().st_mtime
 
     @staticmethod
     def _new_random() -> str:
@@ -792,6 +814,7 @@ class APIKeyStore:
         if not secret or not secret.startswith(self.PREFIX):
             return None
         with self._lock:
+            self._maybe_reload()
             now_ts = int(time.time())
             for key_id, rec in self.data["keys"].items():
                 if rec.get("revoked_at"):
@@ -833,6 +856,7 @@ class APIKeyStore:
 
     def list(self) -> list:
         with self._lock:
+            self._maybe_reload()
             out = []
             for rec in self.data["keys"].values():
                 out.append({k: v for k, v in rec.items() if k != "hash"})
@@ -841,6 +865,7 @@ class APIKeyStore:
     def is_valid(self, key_id: str) -> bool:
         """A key is valid if it exists, is not revoked, and not expired."""
         with self._lock:
+            self._maybe_reload()
             rec = self.data["keys"].get(key_id)
             if not rec or rec.get("revoked_at"):
                 return False
