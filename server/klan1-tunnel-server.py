@@ -2030,6 +2030,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_DELETE(self):
         url = urllib.parse.urlparse(self.path)
         path = url.path.rstrip("/")
+        # DELETE /api/v1/tunnels/<token>  (release a tunnel, JWT-auth)
         m = re.match(r"^/api/v1/tunnels/([^/]+)$", path)
         if m:
             device_id, err = self._require_auth()
@@ -2037,6 +2038,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send_json(401, err)
             res = self.state.release(m.group(1))
             return self._send_json(200 if res.get("ok") else 404, res)
+        # DELETE /api/v1/keys/<id>  (admin revoke, basicauth)
+        if path.startswith("/api/v1/keys/"):
+            if not self._check_basicauth():
+                return self._send_json(401, {"error": "basicauth_required"})
+            if self.api_keys is None:
+                return self._send_json(503, {"error": "api_keys_disabled"})
+            key_id = path[len("/api/v1/keys/"):].strip()
+            if not key_id or "/" in key_id:
+                return self._send_json(400, {"error": "invalid_key_id"})
+            if self.api_keys.revoke(key_id):
+                return self._send_json(200, {"ok": True, "key_id": key_id, "revoked": True})
+            return self._send_json(404, {"error": "key_not_found"})
         self._send_json(404, {"error": "not_found", "path": path})
 
 
