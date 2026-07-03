@@ -51,9 +51,14 @@ is NOT in this repo — it's installed at the OS level on the VPS.
 - API keys store: `/etc/klan1-tunnel/api-keys.json` (still has
   the keys from earlier verification — ok to delete for a clean
   start, or just create new ones from the admin page).
-- The server code at `/usr/local/bin/klan1-tunnel-server.py` is
-  at commit `03898dc` (commit 7 of PLAN-V2 — basicauth + admin
-  dashboard).
+- The server code at `/usr/local/bin/klan1-tunnel-server.py` on
+  ai1 is at commit `03898dc` (the last v1+v2 dual-mode commit).
+  Commits `53259ab` (docs), `b635bd5` (BREAKING cutover), and
+  `268cb73` (MIGRATION.md) are on `main` but have NOT been
+  deployed to ai1. The next `systemctl restart` will pick them
+  up — and at that point, the v1 endpoints stop responding.
+  If you have active v1 tunnels on ai1, follow MIGRATION.md
+  phase 1+2+3 before deploying.
 
 ### Repo state
 
@@ -62,12 +67,10 @@ is NOT in this repo — it's installed at the OS level on the VPS.
 - Remote: `github.com:klan1/klan1-tunnel` (note: `klan1` not
   `klan1-tunnel` as user; the repo is the `klan1-tunnel` repo
   under the `klan1` org).
-- HEAD on main is `03898dc`. Working tree has:
-  - Modified (NOT committed): `README.md`, `INSTALL.md`,
-    `deploy/SIGUIENTE-PASO.md` — these are the v2 docs from
-    commit 8. They are safe to discard or commit.
-  - Untracked: `PLAN-V2.md` (the 10-commit plan), `config/fleet.json`
-    (the local fleet file, `.gitignore`d on purpose).
+- HEAD on main is `268cb73`. Working tree has:
+  - Modified (NOT committed): none as of 2026-07-03.
+  - Untracked: `config/fleet.json` (the local fleet file,
+    `.gitignore`d on purpose; never to be committed).
 
 ### Server file on ai1
 
@@ -103,9 +106,12 @@ All 7 commits are pushed to `main` and deployed on ai1.
 | 7 | `4308dd5` | `feat(server): basicauth + admin dashboard` |
 | 7b | `62599e9` | `fix(server): move GET /api/v1/keys from do_POST to do_GET` |
 | 7c | `03898dc` | `fix(server): move DELETE /api/v1/keys/<id> from do_POST to do_DELETE` |
+| 8 | `53259ab` | `docs: STATUS.md + v2 README/INSTALL + PLAN-V2 banner` |
+| 9 | `b635bd5` | `BREAKING(server): cutover v1 → v2 — remove subdomain + whitelist paths` |
+| 10 | `268cb73` | `docs: MIGRATION.md playbook for the v1 → v2 cutover` |
 
-The full commit-by-commit plan is in `PLAN-V2.md` (untracked, in
-the working tree).
+The full commit-by-commit plan is in `PLAN-V2.md` (now tracked
+in the repo as a historical reference).
 
 ### What works end-to-end on ai1 (verified)
 
@@ -130,26 +136,32 @@ the working tree).
 
 ### What is NOT done
 
-- **Commit 8** (docs): `README.md`, `INSTALL.md` rewrites are
-  partially done in the working tree (uncommitted). They are
-  English-only, scrubbed of real infra (no `tunnels.example.com`, no
+- **Commit 8** (docs): DONE at `53259ab`. `README.md`,
+  `INSTALL.md`, and `deploy/SIGUIENTE-PASO.md` are all in
+  English, scrubbed of real infra (no `tunnels.example.com`, no
   `<your-linux-user>`, no `<your-admin-ssh-port>`, no `70.38.14`, no `tunnels.example.com`).
-  Uses placeholders like `tunnels.example.com`, `api.tunnels.example.com`.
-  These were not pushed (the commit/push was blocked at the
-  end of the session — feel free to commit + push them as-is,
-  or rewrite if you have a different preferred structure).
-- **Commit 9** (cutover v1 → v2): not done. The Caddyfile has
-  already been edited on ai1 to remove the 10 hardcoded vhosts,
-  so the v1 frontend is dead. The server's v1 endpoints
-  (`/api/v1/devices` whitelist-based, the dashboard v1
-  release-by-subdomain form) are still in the code but
-  unreachable for new tunnels (no subdomain → no port
-  allocation). When the v2 admin basicauth is used to create
-  a fresh key, the v2 flow takes over. **The "cutover" commit
-  was about removing the v1 endpoints and the v1 dashboard
-  form. Both are still in the code.**
-- **Commit 10** (runbook): not done. `MIGRATION.md` doesn't
-  exist.
+  Uses placeholders like `tunnels.example.com`,
+  `api.tunnels.example.com`.
+- **Commit 9** (BREAKING cutover v1 → v2): DONE at `b635bd5`.
+  All v1 code paths removed: `SUBDOMAIN_PORTS`, the
+  `provision_tunnel_user` / `_provision_tunnel_user_locked`
+  functions, the v1 `/api/v1/devices` GET endpoint, the v1
+  `/api/v1/tunnels` POST handler, the v1 `/dashboard/provision`
+  POST handler, the `subdomain` / `server_alias` / `egress_ip`
+  form fields, the v1 path of the `Auth` class (whitelist
+  check), the `devices_path` argument and the `load_devices()`
+  method, and the `/api/v1/free-port` endpoint. The caddy slice
+  generation was inlined from a `CaddyManager` module class
+  into `Handler` methods (`generate_caddyfile`,
+  `_caddy_validate`, `_caddy_reload`, `_caddy_reload_for_tunnel`).
+  The sweeper was wrapped in a `Sweeper` class (same logic,
+  same 30s interval). `Auth.login` was renamed to
+  `issue_token_for_key` (more descriptive of what it does in
+  v2). Server went from 2639 → 2356 lines (-283).
+- **Commit 10** (migration runbook): DONE at `268cb73`.
+  `MIGRATION.md` at the repo root. Step-by-step runbook for
+  cutting over a live v1 server to v2, with rollback
+  procedures, smoke tests, and FAQ.
 
 ---
 
@@ -307,8 +319,9 @@ GET /api/v1/tunnels
 GET /api/v1/free-port
   resp: 200 {port, range: [lo, hi]}
 
-GET /api/v1/devices         (v1 — legacy whitelist, kept for back compat)
-  resp: 200 {devices: [...]}
+GET /api/v1/devices         (v1 — REMOVED in commit 9, returns 410 Gone)
+  resp: 410 {"error": "v1_removed",
+             "use": "/dashboard/admin to create an API key"}
 ```
 
 ### Admin (HTTP Basic)
@@ -403,7 +416,7 @@ not re-litigate them without checking in.
 | D7 | Caddy reload dynamic, not wildcard | User chose this. Dry-run before reload. |
 | D8 | Implicit release on missing heartbeat | Server already has `default-ttl=86400`. |
 | D9 | Big-bang cutover (no v1/v2 coexistence) | User chose this. |
-| D10 | v1 endpoints kept through commit 8, removed in commit 9 | For smooth rollout. |
+| D10 | v1 endpoints kept through commit 8, removed in commit 9 (DONE at b635bd5) | For smooth rollout. |
 | D11 | Use `Optional[int]`, not `int \| None` | Python 3.9 compat. |
 | D12 | Hash format: `pbkdf2_sha256$<iters>$<salt_b64>$<dk_hex>` | Passlib-style, self-describing. |
 | D13 | ad-hoc verification with `tempfile.mkstemp` | Compliance with the agent's system rule to verify local disk changes. |
@@ -479,53 +492,29 @@ command output.
 
 ---
 
-## 10. What's in PLAN-V2.md but not in code yet
+## 10. Status of PLAN-V2.md
 
-If you want to continue the plan, the remaining work is:
+**All 10 commits DONE.** Plan complete.
 
-### Commit 8 (docs)
+| # | SHA | Title | Status |
+|---|---|---|---|
+| 1 | `f95c7dc` | `feat(server): APIKeyStore for v2` | done |
+| 2 | `3cef248` | `feat(server): v2 auth — login with api_key + keys CRUD` | done |
+| 3 | `bcaecef` | `feat(server): v2 provision endpoint` | done |
+| 3b | `f43d4f3` | `fix(server): APIKeyStore reloads on mtime change` | done |
+| 4 | `e0b0902` | `feat(server): Caddyfile generator + dry-run + reload` | done |
+| 5 | `25520dd` | `feat(server): sweeper cleans up expired + revoked-key tunnels` | done |
+| 5b | `a4130ff` | `fix(server): State._maybe_reload` | done |
+| 6 | `0088992` | `feat(client): installer v2` | done |
+| 7 | `4308dd5` | `feat(server): basicauth + admin dashboard` | done |
+| 7b | `62599e9` | `fix(server): move GET /api/v1/keys to do_GET` | done |
+| 7c | `03898dc` | `fix(server): move DELETE /api/v1/keys to do_DELETE` | done |
+| 8 | `53259ab` | `docs: STATUS.md + v2 README/INSTALL + PLAN-V2 banner` | done |
+| 9 | `b635bd5` | `BREAKING(server): cutover v1 → v2 — remove subdomain + whitelist paths` | done |
+| 10 | `268cb73` | `docs: MIGRATION.md playbook for the v1 → v2 cutover` | done |
 
-- `README.md` rewrite — English, scrubbed, v2 contract.
-  **Already done in working tree, uncommitted.**
-- `INSTALL.md` rewrite — full admin install walkthrough.
-  **Already done in working tree, uncommitted.**
-- `deploy/SIGUIENTE-PASO.md` → placeholder.
-  **Already done in working tree, uncommitted.**
-- Action: commit these 3 files with a message like
-  `docs: rewrite README + INSTALL for v2 (commit 8)`. Push.
-
-### Commit 9 (BREAKING: cutover v1 → v2)
-
-- Remove the v1 dashboard form fields (subdomain, server_alias).
-  The dashboard should only have a "create new tunnel" form
-  that asks for the device_id (the user types it).
-- Remove the v1 endpoints:
-  - `POST /api/v1/devices` (whitelist-style, not auth'd)
-  - The v1 `provision_tunnel_user` function
-  - The v1 dashboard "release" form's `subdomain` field
-- Make the v2 flow the default. No `?v=1` query params, no
-  feature flags.
-- This is a real breaking change. Verify backwards compat is
-  not needed (the user explicitly said big-bang, so v1 is dead).
-
-### Commit 10 (runbook)
-
-- Create `MIGRATION.md` at the repo root. Step-by-step
-  runbook for cutting over from v1 to v2 on a live server.
-- Walk through:
-  1. Announce to users 5 min ahead.
-  2. Save current state.json.
-  3. Deploy commits 1-8 (backwards-compat).
-  4. Run admin: create API key for each existing tunnel's
-     owner (or have the owner re-run the installer).
-  5. Watch heartbeats. Once all 10 ports are re-provisioned
-     under v2, the v1 state can be archived.
-  6. Deploy commit 9 (destructive — v1 endpoints gone).
-  7. Edit the Caddyfile to remove the 10 hardcoded vhosts
-     (the user already did this manually; document it for
-     the runbook).
-  8. Smoke test: provision a fresh tunnel end-to-end.
-- The runbook should be in English.
+The PLAN-V2.md file is kept in the repo (now tracked) as a
+historical reference — the v2 plan from 2026-07-02.
 
 ---
 
