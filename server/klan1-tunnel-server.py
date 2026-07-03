@@ -1566,11 +1566,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "detail": prov.get("error"),
                 })
 
-            # Build the SSH command the installer will run
+            # Build the SSH command the installer will run. The client
+            # connects as the per-tunnel user (e.g. tunnel-65081) on the
+            # standard SSH port — the API host + port for the admin
+            # connection is not exposed in the bundle.
             ssh_host = API_HOST or "<your-server-host>"
-            ssh_user = "<your-linux-user>"  # from fleet.json; hard-coded for now
-            ssh_port = <your-admin-ssh-port>
             tunnel_user = prov["user"]
+            ssh_user = tunnel_user
+            ssh_port = 22
             ssh_cmd = (
                 f"ssh -i ~/.klan1-tunnel/id_ed25519_{tunnel_user} "
                 f"-N -T -R {port}:127.0.0.1:{local_port} "

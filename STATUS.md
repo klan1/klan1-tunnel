@@ -31,7 +31,7 @@ is NOT in this repo — it's installed at the OS level on the VPS.
 
 ### Server: ai1 (the test VPS)
 
-- Public IP: `<your-server-public-ip>:<your-admin-ssh-port>` (SSH)
+- Public IP: `<your-server-public-ip>` (SSH on the standard port)
 - Web/SSH-tunnel port range: `65081-65090` (10 ports)
 - API endpoint (Caddy TLS): `https://api.tunnels.example.com/`
 - Server is currently **stopped / running, no tunnels active**
@@ -138,10 +138,9 @@ in the repo as a historical reference).
 
 - **Commit 8** (docs): DONE at `53259ab`. `README.md`,
   `INSTALL.md`, and `deploy/SIGUIENTE-PASO.md` are all in
-  English, scrubbed of real infra (no `tunnels.example.com`, no
-  `<your-linux-user>`, no `<your-admin-ssh-port>`, no `70.38.14`, no `tunnels.example.com`).
-  Uses placeholders like `tunnels.example.com`,
-  `api.tunnels.example.com`.
+  English, scrubbed of real infrastructure (all references use
+  `<placeholder>` form). Uses placeholders like
+  `tunnels.example.com`, `api.tunnels.example.com`.
 - **Commit 9** (BREAKING cutover v1 → v2): DONE at `b635bd5`.
   All v1 code paths removed: `SUBDOMAIN_PORTS`, the
   `provision_tunnel_user` / `_provision_tunnel_user_locked`
@@ -552,9 +551,9 @@ historical reference — the v2 plan from 2026-07-02.
    Python script locally, `scp` it to `/tmp/` on ai1, `ssh
    ai1-root "python3 /tmp/script.py"`. Use `subprocess.run`
    with a list, not `shell=True`, to avoid quote pain.
-9. **Commit messages.** Use `git -c user.name=<your-linux-user> -c
-   user.email=<your-email@example.com> commit -m "..."` — the user
-   uses this identity for this repo.
+9. **Commit messages.** Use `git -c user.name=<your-git-user> -c
+   user.email=<your-git-email> commit -m "..."` — pick the
+   identity that matches your `~/.gitconfig` for this repo.
 10. **No `git pull --rebase` on the user's macOS.** They
     prefer to fetch + rebase manually if needed, but the
     branch has been stable for 11 commits, no merge issues
