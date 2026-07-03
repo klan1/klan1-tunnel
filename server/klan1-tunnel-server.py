@@ -1,19 +1,39 @@
 #!/usr/bin/env python3
 """
-klan1-tunnel-server - Self-hosted ngrok-like API
+klan1-tunnel-server - Self-hosted ngrok-like API (v2, API-key based)
 
 Tiny stdlib HTTP server. No external deps. Stores state in a JSON file.
-Endpoints:
-  POST /api/v1/tunnels              register a tunnel, allocate port, return token
-  POST /api/v1/tunnels/<token>/heartbeat  extend TTL
-  DELETE /api/v1/tunnels/<token>    release the tunnel
-  GET  /api/v1/tunnels              list active tunnels
-  GET  /api/v1/free-port            suggest next free port in the range
-  GET  /                            web dashboard (HTML)
-  GET  /healthz                     liveness
+
+v2 endpoints (the only ones that work — v1 is gone in commit 9):
+  POST /api/v1/auth/login               {device_id, api_key} -> JWT
+  POST /api/v1/auth/refresh             (Bearer JWT) -> new JWT bound to same key
+  POST /api/v1/devices/<id>/provision   (Bearer JWT) -> bundle (token, ssh_user, port, key, fqdn, ...)
+  POST /api/v1/tunnels/<token>/heartbeat (Bearer JWT) -> extend TTL
+  DELETE /api/v1/tunnels/<token>        (Bearer JWT) -> release
+  GET  /api/v1/tunnels                  list active tunnels (no auth)
+  GET  /api/v1/free-port                suggest next free port in the range
+
+  Admin (basicauth):
+  GET    /api/v1/keys                   list API keys
+  POST   /api/v1/keys                   {name, ttl} -> create key (secret shown once)
+  DELETE /api/v1/keys/<id>              revoke a key
+  GET    /dashboard/admin               (HTML) admin panel
+
+  Health/UI:
+  GET  /healthz                         liveness
+  GET  /                                (HTML) tunnel table
+  GET  /dashboard/ssh-command?token=...  (JSON) ssh command for a tunnel
+
+v1 endpoints removed in commit 9 (return 410 Gone):
+  GET  /api/v1/devices                  (whitelist — gone, use /dashboard/admin)
+  POST /api/v1/tunnels                  (subdomain-based provision — gone)
+  POST /dashboard/provision             (v1 form — gone, redirect to / with info flash)
 
 Run:
-  python3 klan1-tunnel-server.py --port 8443 --state /var/lib/klan1-tunnel/state.json
+  python3 klan1-tunnel-server.py --port 65500 --bind 127.0.0.1 \\
+      --state /var/lib/klan1-tunnel/state.json \\
+      --key-dir /etc/klan1-tunnel \\
+      --port-lo 65081 --port-hi 65090 --default-ttl 86400
 
 Author: klan1-tunnel contributors
 """
@@ -143,11 +163,6 @@ def gen_token() -> str:
     return secrets.token_urlsafe(18)
 
 
-# Map of subdomain (1..10) -> port
-SUBDOMAIN_PORTS = {
-    "1": 65081, "2": 65082, "3": 65083, "4": 65084, "5": 65085,
-    "6": 65086, "7": 65087, "8": 65088, "9": 65089, "10": 65090,
-}
 # Serialize all useradd/groupadd calls behind a file lock so concurrent
 # provisions don't trip "cannot lock /etc/group" on a fluke. Also makes
 # the whole provision operation idempotent: if two dashboard clicks
@@ -184,154 +199,6 @@ def generate_keypair_ed25519() -> tuple[str, str]:
         format=serialization.PublicFormat.OpenSSH,
     )
     return private_bytes.decode("ascii"), public_bytes.decode("ascii")
-
-
-def provision_tunnel_user(subdomain: str) -> dict:
-    """On-demand: create user tunnel-<port>, install public key with restrict+permitopen.
-
-    Returns dict with: ok, port, user, private_key, error
-    Side effects:
-      - useradd if missing
-      - mkdir /home/<user>/.ssh (700)
-      - writes /etc/klan1-tunnel/tunnel-<port>.key (0600 root)
-      - writes /home/<user>/.ssh/authorized_keys (0600) with the matching pubkey
-    """
-    # Normalize: dashboard may pass int from form.get("subdomain"); the keys
-    # in SUBDOMAIN_PORTS are strings "1".."10". Accept both, but compare as
-    # strings consistently so the lookup never KeyErrors.
-    subdomain = str(subdomain).strip()
-    if subdomain not in SUBDOMAIN_PORTS:
-        return {"ok": False, "error": f"invalid_subdomain:{subdomain!r}"}
-
-    # Serialize the whole provision operation behind a file lock so two
-    # concurrent dashboard clicks (or a click during unattended-upgrade)
-    # don't trip the /etc/group lock that useradd holds briefly.  flock
-    # blocks; it does not fail with "cannot lock /etc/group".
-    _PROVISION_LOCK.parent.mkdir(parents=True, exist_ok=True)
-    lock_fd = open(_PROVISION_LOCK, "w")
-    try:
-        import fcntl
-        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
-    except Exception as e:
-        lock_fd.close()
-        return {"ok": False, "error": f"provision_failed:lock:{e}"}
-
-    try:
-        return _provision_tunnel_user_locked(subdomain)
-    finally:
-        try:
-            import fcntl
-            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
-        except Exception:
-            pass
-        lock_fd.close()
-
-
-def _provision_tunnel_user_locked(subdomain: str) -> dict:
-    port = SUBDOMAIN_PORTS[subdomain]
-    user = f"tunnel-{port}"
-    user_home = USERS_BASE / user
-    ssh_dir = user_home / ".ssh"
-    auth_keys = ssh_dir / "authorized_keys"
-    keyfile = KEYS_BASE / f"{user}.key"
-
-    try:
-        # Make sure the group exists
-        try:
-            import grp
-            grp.getgrnam(TUNNELS_GROUP)
-        except KeyError:
-            subprocess.run(
-                ["groupadd", TUNNELS_GROUP],
-                check=True, capture_output=True,
-            )
-
-        # Create the user if missing. The shell is set to the restrictive
-        # tunnel-shell.sh (which execs sleep infinity). Home dir lives under
-        # USERS_BASE (not /home) because the systemd unit ProtectHome=true.
-        try:
-            pw = pwd.getpwnam(user)
-        except KeyError:
-            user_home.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                os.chmod(user_home.parent, 0o755)
-            except OSError:
-                pass
-            subprocess.run(
-                ["useradd", "-M", "-d", str(user_home),
-                 "-s", TUNNEL_SHELL, "-G", TUNNELS_GROUP, user],
-                check=True, capture_output=True,
-            )
-            pw = pwd.getpwnam(user)
-
-        # Ensure .ssh exists with right perms (under USERS_BASE).
-        try:
-            user_home.mkdir(parents=True, exist_ok=True)
-            ssh_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            return {"ok": False, "error": f"provision_failed:mkdir:{e}"}
-
-        try:
-            os.chmod(user_home, 0o700)
-            os.chmod(ssh_dir, 0o700)
-        except OSError:
-            pass
-
-        try:
-            os.chown(user_home, pw.pw_uid, pw.pw_gid)
-            os.chown(ssh_dir, pw.pw_uid, pw.pw_gid)
-        except OSError as e:
-            print(f"[provision] chown: {e}", file=sys.stderr)
-
-        # Generate the keypair
-        private_key, public_key = generate_keypair_ed25519()
-
-        # Save the private key (root only) so we can re-deliver it on retries
-        try:
-            keyfile.parent.mkdir(parents=True, exist_ok=True)
-            os.chmod(keyfile.parent, 0o700)
-        except (OSError, PermissionError):
-            pass
-
-        keyfile.write_text(private_key + "\n")
-        os.chmod(keyfile, 0o600)
-
-        # Build authorized_keys with restrict + permitopen
-        # restrict implies no-pty, no-X11, no-agent, no-user-rc, no-port-forwarding-local,
-        # so we explicitly re-enable remote port-forwarding with permitopen.
-        auth_line = (
-            f'command="",from="*",restrict,port-forwarding,'
-            f'permitopen="127.0.0.1:{port}" {public_key}'
-        )
-        try:
-            auth_keys.write_text(auth_line + "\n")
-            os.chmod(auth_keys, 0o600)
-        except OSError as e:
-            return {"ok": False, "error": f"provision_failed:write_auth_keys:{e}"}
-
-        try:
-            os.chown(auth_keys, pw.pw_uid, pw.pw_gid)
-        except OSError as e:
-            print(f"[provision] chown auth_keys: {e}", file=sys.stderr)
-
-        return {
-            "ok": True,
-            "user": user,
-            "port": port,
-            "private_key": private_key,
-        }
-    except subprocess.CalledProcessError as e:
-        return {
-            "ok": False,
-            "error": f"provision_failed:{e.stderr.decode(errors='replace')}",
-        }
-    except Exception as e:
-        import traceback
-        return {
-            "ok": False,
-            "error": f"provision_failed:{type(e).__name__}:{e}",
-            "trace": traceback.format_exc(),
-        }
 
 
 class State:
@@ -617,22 +484,25 @@ class State:
 
 
 # ----------------------------------------------------------------------------
-# Auth layer (JWT RS256 with device whitelist)
+# Auth layer (JWT RS256, API-key-bound, v2 only)
 # ----------------------------------------------------------------------------
 
 class Auth:
-    """JWT-based authentication with a persistent device whitelist.
+    """JWT-based authentication, v2 (API-key-bound).
 
     State files (all owned by root, mode 0600):
       - jwt-private.pem: RSA private key, signs JWTs
       - jwt-public.pem:  RSA public key, validates JWTs
-      - devices.json:    {"devices": {"<id>": {"name": "...", "active": true, ...}}}
 
     Tokens are RS256 JWTs with claims:
       sub:    device_id
-      name:   human-readable name
+      name:   human-readable name (from API key)
+      key_id: API key that minted this JWT (REQUIRED in v2)
       iat:    issued-at (unix)
       exp:    expires-at (unix)
+
+    v1 device-whitelist auth was removed in commit 9. Any token
+    without a 'key_id' claim is rejected as legacy.
     """
 
     def __init__(self, key_dir: Path, ttl: int = DEFAULT_JWT_TTL_SECONDS):
@@ -642,84 +512,18 @@ class Auth:
         self.ttl = ttl
         self.priv_path = key_dir / "jwt-private.pem"
         self.pub_path = key_dir / "jwt-public.pem"
-        self.devices_path = key_dir / "devices.json"
         if not self.priv_path.exists() or not self.pub_path.exists():
             raise RuntimeError(f"JWT keys missing in {key_dir}; run: openssl genrsa -out jwt-private.pem 2048 && openssl rsa -in jwt-private.pem -pubout -out jwt-public.pem")
         self.priv_pem = self.priv_path.read_bytes()
         self.pub_pem = self.pub_path.read_bytes()
-        self._lock = threading.RLock()
-        self._load_devices()
-
-    def _load_devices(self):
-        if self.devices_path.exists():
-            try:
-                self.devices = json.loads(self.devices_path.read_text())
-            except Exception:
-                self.devices = {"devices": {}}
-        else:
-            self.devices = {"devices": {}}
-        if "devices" not in self.devices:
-            self.devices = {"devices": {}}
-
-    def _save_devices(self):
-        tmp = self.devices_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.devices, indent=2, sort_keys=True))
-        tmp.replace(self.devices_path)
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
-        os.chmod(self.devices_path, 0o600)
-
-    def list_devices(self) -> list:
-        with self._lock:
-            return [{"device_id": k, **v} for k, v in self.devices["devices"].items()]
-
-    def add_device(self, device_id: str, name: str = None) -> dict:
-        with self._lock:
-            if device_id in self.devices["devices"]:
-                return {"ok": False, "error": "device_exists"}
-            self.devices["devices"][device_id] = {
-                "name": name or device_id,
-                "active": True,
-                "created_at": now_utc(),
-            }
-            self._save_devices()
-            return {"ok": True, "device_id": device_id, "name": name or device_id}
-
-    def revoke_device(self, device_id: str) -> dict:
-        with self._lock:
-            if device_id not in self.devices["devices"]:
-                return {"ok": False, "error": "unknown_device"}
-            self.devices["devices"][device_id]["active"] = False
-            self.devices["devices"][device_id]["revoked_at"] = now_utc()
-            self._save_devices()
-            return {"ok": True, "device_id": device_id, "active": False}
-
-    def is_device_active(self, device_id: str) -> bool:
-        with self._lock:
-            d = self.devices["devices"].get(device_id)
-            return bool(d and d.get("active"))
-
-    def issue_token(self, device_id: str) -> str:
-        """Sign and return a JWT for the given device_id."""
-        with self._lock:
-            d = self.devices["devices"].get(device_id, {})
-        now = int(time.time())
-        payload = {
-            "sub": device_id,
-            "name": d.get("name", device_id),
-            "iat": now,
-            "exp": now + self.ttl,
-        }
-        return jwt.encode(payload, self.priv_pem, algorithm=DEFAULT_JWT_ALGO)
 
     def issue_token_for_key(self, device_id: str, key_id: str,
                             key_name: str = "") -> str:
         """Sign and return a JWT bound to a specific API key.
 
-        Adds a 'key_id' claim so downstream code can verify the key is
-        still valid (not revoked) and trace which key created a tunnel."""
+        The 'key_id' claim is mandatory in v2 — it lets the sweeper
+        trace which key created a tunnel and reaps the tunnel if the
+        key is later revoked."""
         now = int(time.time())
         payload = {
             "sub": device_id,
@@ -733,14 +537,9 @@ class Auth:
     def validate_token(self, token: str) -> dict:
         """Return the claims dict if valid, or an error string.
 
-        Two flavors of JWT are accepted:
-          - v1: payload has 'sub' (device_id) but no 'key_id'. The
-            device must be in devices.json with active=true.
-          - v2: payload has 'sub' (device_id) AND 'key_id'. The device
-            does NOT need to be in devices.json — the API key is the
-            credential, and the device is whatever the client claimed
-            in the URL. The key must still be valid (not revoked, not
-            expired) at the moment of the request.
+        v2 only: every JWT must carry a 'key_id' claim. Tokens
+        without one are legacy v1 (device-whitelist) tokens and
+        are rejected — no backwards compat.
         """
         try:
             claims = jwt.decode(token, self.pub_pem, algorithms=[DEFAULT_JWT_ALGO])
@@ -751,17 +550,9 @@ class Auth:
         device_id = claims.get("sub")
         if not device_id:
             return {"error": "no_sub"}
-        # v2 path: api_key-bound JWT. The key is checked at issuance
-        # time (in /api/v1/auth/login); we don't re-check validity here
-        # because revoking a key should not invalidate already-issued
-        # JWTs mid-flight. The sweeper + /api/v1/tunnels/<tok>/heartbeat
-        # are the right places to fail closed if the key was revoked
-        # between JWT issuance and use.
-        if claims.get("key_id"):
-            return {"ok": True, "device_id": device_id, "claims": claims}
-        # v1 path: device must be active in the whitelist.
-        if not self.is_device_active(device_id):
-            return {"error": "device_revoked"}
+        if not claims.get("key_id"):
+            # v1 token (no key_id claim). Reject — v1 is gone.
+            return {"error": "legacy_v1_token"}
         return {"ok": True, "device_id": device_id, "claims": claims}
 
 
@@ -1582,13 +1373,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             port = self.state.next_free_port()
             self._send_json(200, {"port": port, "range": [self.state.port_lo, self.state.port_hi]})
         elif path == "/api/v1/devices":
-            # Requires auth — list devices visible to this caller
-            device_id, err = self._require_auth()
-            if err:
-                return self._send_json(401, err)
-            if self.auth is None:
-                return self._send_json(503, {"error": "auth_disabled"})
-            self._send_json(200, {"devices": self.auth.list_devices()})
+            # v1 endpoint (whitelist-based) — removed in commit 9.
+            # v2 is API-key-based; create a key from the admin dashboard
+            # and pass it to the installer. Returns 410 Gone per the
+            # spec so any old client (still pointing here) gets a
+            # clear, intentional signal.
+            return self._send_json(410, {
+                "error": "v1_removed",
+                "use": "/dashboard/admin to create an API key",
+            })
         elif path == "/api/v1/keys":
             # GET /api/v1/keys — list API keys (admin, basicauth).
             if not self._check_basicauth():
@@ -1616,62 +1409,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # re-renders the dashboard with a flash message.
 
         if path == "/dashboard/provision":
-            # Provision a new tunnel: provision on-demand user + reserve port.
-            form = self._read_form() or {}
-            name = _str(form.get("name")).strip()
-            subdomain_str = _str(form.get("subdomain")).strip()
-            proto = _str(form.get("protocol") or "http").strip().lower()
-            try:
-                local_port = int(_str(form.get("local_port") or 8080))
-            except (TypeError, ValueError):
-                local_port = 8080
-
-            if not name:
-                return self._dashboard_redirect("Name is required", "err")
-            if proto not in ("http", "socks5", "tcp"):
-                proto = "http"
-            try:
-                subdomain = int(subdomain_str) if subdomain_str else None
-            except ValueError:
-                return self._dashboard_redirect(f"Invalid subdomain: {subdomain_str}", "err")
-
-            if subdomain is None:
-                return self._dashboard_redirect("Subdomain is required", "err")
-
-            try:
-                prov = provision_tunnel_user(str(subdomain))
-                if not prov.get("ok"):
-                    return self._dashboard_redirect(
-                        f"Could not provision tunnel-{prov.get('port','?')}: {prov.get('error')}",
-                        "err",
-                    )
-                rport = prov["port"]
-                tunnel_user = prov["user"]
-                private_key = prov["private_key"]
-            except Exception as e:
-                return self._dashboard_redirect(f"Exception during provision: {e}", "err")
-
-            res = self.state.reserve(name, rport, proto, "primary", "dashboard", 86400)
-            if not res.get("ok"):
-                return self._dashboard_redirect(f"Could not reserve: {res}", "err")
-
-            token = res["token"]
-            ssh_cmd = (
-                f"ssh -i ~/.klan1-tunnel/id_ed25519_{tunnel_user} "
-                f"-N -T -R {rport}:127.0.0.1:{local_port} "
-                f"{tunnel_user}@{API_HOST}"
+            # v1 endpoint (subdomain-based, on-demand user creation)
+            # — removed in commit 9. v2 provisions are done by the
+            # client via /api/v1/devices/<id>/provision after the
+            # admin mints an API key. Returning a redirect to /
+            # with a clear flash message so any bookmarked/old
+            # browser action lands on the dashboard with guidance.
+            return self._dashboard_redirect(
+                "Dashboard provision is gone in v2 — create an API "
+                "key from /dashboard/admin and run the installer with "
+                "--device-id <name> --api-key <key>", "info",
             )
-            fqdn = f"{subdomain}.{BASE_DOMAIN}"
-            # Show the SSH command + private key inline in the dashboard
-            return self._send_html(200, render_dashboard(
-                self.state.list(),
-                self.state.port_lo,
-                self.state.port_hi,
-                flash_msg=f"Tunnel '{name}' created at https://{fqdn} — copy the SSH key BELOW",
-                flash_kind="ok",
-                private_key_for_token=private_key,
-                ssh_command_for_token=ssh_cmd,
-            ))
 
         if path == "/dashboard/release-bulk":
             form = self._read_form() or {}
@@ -1740,7 +1488,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._dashboard_redirect(f"Error extending: {e}", "err")
 
         # v2 provision: POST /api/v1/devices/<device_id>/provision
-        # Requires JWT (any kind: v1 whitelist or v2 api_key-bound).
+        # Requires an API-key-bound JWT (key_id claim).
         # Returns the full bundle (device_id, tunnel_user, tunnel_port,
         # fqdn, ssh_host, ssh_user, ssh_port, private_key, ssh_command,
         # expires_at, ttl, token) so the installer can save the key and
@@ -1867,55 +1615,67 @@ class Handler(http.server.BaseHTTPRequestHandler):
             api_key = (data.get("api_key") or "").strip()
             if not device_id:
                 return self._send_json(400, {"error": "device_id_required"})
+            if not api_key:
+                # v1 (no api_key) path is gone — api_key is mandatory in v2.
+                return self._send_json(400, {"error": "api_key_required"})
 
-            # v2 path: login with an API key. Independent of any device
-            # in the v1 devices.json whitelist — the key is the credential.
-            if api_key:
-                if self.api_keys is None:
-                    return self._send_json(503, {"error": "api_keys_disabled"})
-                rec = self.api_keys.verify(api_key)
-                if not rec:
-                    return self._send_json(401, {"error": "invalid_api_key"})
-                # Re-check validity (revoked/expired) at the auth layer too
-                if not self.api_keys.is_valid(rec["id"]):
-                    return self._send_json(401, {"error": "api_key_revoked"})
-                token = self.auth.issue_token_for_key(
-                    device_id=device_id,
-                    key_id=rec["id"],
-                    key_name=rec.get("name", ""),
-                )
-                return self._send_json(200, {
-                    "ok": True,
-                    "token": token,
-                    "device_id": device_id,
-                    "key_id": rec["id"],
-                    "expires_in": self.auth.ttl,
-                })
-
-            # v1 path: device in devices.json whitelist. Kept for
-            # backwards compat — the existing `mac-hq` tunnel on ai1
-            # still uses this until the v2 cutover.
-            if not self.auth.is_device_active(device_id):
-                return self._send_json(403, {"error": "device_not_active"})
-            token = self.auth.issue_token(device_id)
+            # v2 path: login with an API key. The key is the credential.
+            if self.api_keys is None:
+                return self._send_json(503, {"error": "api_keys_disabled"})
+            rec = self.api_keys.verify(api_key)
+            if not rec:
+                return self._send_json(401, {"error": "invalid_api_key"})
+            # Re-check validity (revoked/expired) at the auth layer too
+            if not self.api_keys.is_valid(rec["id"]):
+                return self._send_json(401, {"error": "api_key_revoked"})
+            token = self.auth.issue_token_for_key(
+                device_id=device_id,
+                key_id=rec["id"],
+                key_name=rec.get("name", ""),
+            )
             return self._send_json(200, {
                 "ok": True,
                 "token": token,
                 "device_id": device_id,
+                "key_id": rec["id"],
                 "expires_in": self.auth.ttl,
             })
 
         if path == "/api/v1/auth/refresh":
+            # v2: re-issue a fresh JWT bound to the same API key
+            # (the key_id is in the current token's claims). v1
+            # used a device-only refresh; that path is gone.
             if self.auth is None:
                 return self._send_json(503, {"error": "auth_disabled"})
-            device_id, err = self._require_auth()
-            if err:
-                return self._send_json(401, err)
-            token = self.auth.issue_token(device_id)
+            auth_header = self.headers.get("Authorization", "")
+            token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
+            if not token:
+                return self._send_json(401, {"error": "missing_bearer"})
+            vres = self.auth.validate_token(token)
+            if not vres.get("ok"):
+                return self._send_json(401, vres)
+            claims = vres.get("claims", {}) or {}
+            device_id = claims.get("sub", "")
+            key_id = claims.get("key_id", "")
+            if not device_id or not key_id:
+                return self._send_json(401, {"error": "legacy_v1_token"})
+            # Look up the key name for the JWT 'name' claim (best-effort)
+            key_name = ""
+            if self.api_keys is not None:
+                for rec in self.api_keys.list():
+                    if rec.get("id") == key_id:
+                        key_name = rec.get("name", "")
+                        break
+            new_token = self.auth.issue_token_for_key(
+                device_id=device_id,
+                key_id=key_id,
+                key_name=key_name,
+            )
             return self._send_json(200, {
                 "ok": True,
-                "token": token,
+                "token": new_token,
                 "device_id": device_id,
+                "key_id": key_id,
                 "expires_in": self.auth.ttl,
             })
 
@@ -1959,62 +1719,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         m = re.match(r"^/api/v1/tunnels/([^/]+)/heartbeat$", path)
         if path == "/api/v1/tunnels":
-            # Require auth
-            device_id, err = self._require_auth()
-            if err:
-                return self._send_json(401, err)
-            data = self._read_json()
-            if data is None:
-                return self._send_json(400, {"error": "bad_json"})
-            name = (data.get("name") or device_id or "anon").strip()
-            subdomain = (data.get("subdomain") or "").strip()
-            try:
-                rport = int(data.get("remote_port") or 0)
-            except (TypeError, ValueError):
-                rport = 0
-            proto = (data.get("protocol") or "http").lower()
-            if proto not in ("http", "socks5", "tcp"):
-                proto = "http"
-            try:
-                ttl = int(data.get("ttl") or self.state.default_ttl)
-            except (TypeError, ValueError):
-                ttl = self.state.default_ttl
-            ttl = max(60, min(ttl, 7 * 24 * 3600))
-            server_alias = (data.get("server_alias") or "primary").strip() or "primary"
-            egress_ip = (data.get("egress_ip") or "").strip() or "unknown"
-
-            # If a subdomain was given, on-demand provision the tunnel user
-            # and return the private key. The client uses this key to open
-            # the SSH reverse tunnel.
-            private_key = None
-            tunnel_user = None
-            if subdomain:
-                prov = provision_tunnel_user(subdomain)
-                if not prov.get("ok"):
-                    return self._send_json(503, {
-                        "ok": False,
-                        "error": "provision_failed",
-                        "detail": prov.get("error"),
-                    })
-                rport = prov["port"]
-                tunnel_user = prov["user"]
-                private_key = prov["private_key"]
-
-            res = self.state.reserve(name, rport, proto, server_alias, egress_ip, ttl)
-            code = 200 if res.get("ok") else (409 if res.get("error") == "name_in_use" else 503)
-
-            # Augment the response with tunnel info (private key + user)
-            if private_key and res.get("ok"):
-                res["private_key"] = private_key
-                res["user"] = tunnel_user
-                res["subdomain"] = subdomain
-                res["subdomain_fqdn"] = f"{subdomain}.{BASE_DOMAIN}"
-                res["ssh_command"] = (
-                    f"ssh -i ~/.klan1-tunnel/id_ed25519_{tunnel_user} "
-                    f"-N -T -R {rport}:127.0.0.1:{data.get('local_port', 8080)} "
-                    f"{tunnel_user}@{API_HOST}"
-                )
-            return self._send_json(code, res)
+            # v1 POST: client chose a subdomain, server on-demand provisioned
+            # the tunnel user, and the key came from devices.json. Removed
+            # in commit 9. v2 clients use POST /api/v1/devices/<id>/provision
+            # (which requires an API-key-bound JWT). Anything hitting this
+            # bare endpoint is a legacy v1 client.
+            return self._send_json(410, {
+                "error": "v1_removed",
+                "use": "POST /api/v1/devices/<device_id>/provision (with API key)",
+            })
         elif m:
             token = m.group(1)
             device_id, err = self._require_auth()
@@ -2166,25 +1879,29 @@ def render_dashboard(tunnels, port_lo, port_hi, flash_msg=None, flash_kind="info
             parts.append(f'<div class="ssh-label">Private key (copialo YA — solo se muestra una vez):</div><textarea class="ssh-key" rows="10" readonly>{escape_html(private_key_for_token)}</textarea>')
         ssh_panel_html = '<div class="ssh-panel">' + "".join(parts) + '</div>'
 
-    # Provision form
+    # Provision form (v2)
+    # v1 had a "Create new tunnel" form here that asked for a
+    # subdomain number and on-demand provisioned the unix user. v2
+    # provisions are done by the client (the installer) against
+    # /api/v1/devices/<id>/provision, after the admin mints an API
+    # key. This card is now a static how-to.
     provision_form = f"""
 <div class="provision-card">
-  <h2>Create new tunnel</h2>
-  <form method="POST" action="/dashboard/provision" class="provision-form">
-    <label>Name (device) <input name="name" required placeholder="macbook"></label>
-    <label>Subdomain #
-      <input name="subdomain" type="number" min="1" max="10" required placeholder="1">
-    </label>
-    <label>Protocol
-      <select name="protocol">
-        <option value="http">http</option>
-        <option value="socks5">socks5</option>
-        <option value="tcp">tcp</option>
-      </select>
-    </label>
-    <label>Local port <input name="local_port" type="number" min="1" max="65535" value="8080"></label>
-    <button type="submit" class="btn btn-primary">Provisionar</button>
-  </form>
+  <h2>Create a new tunnel</h2>
+  <p style="margin:0 0 8px;color:#8b949e;font-size:13px;line-height:1.5">
+    v2 is API-key based. To bring up a tunnel on a new client:
+  </p>
+  <ol style="margin:0 0 12px;padding-left:20px;color:#c9d1d9;font-size:13px;line-height:1.6">
+    <li>Create an API key from the <a href="/dashboard/admin" class="nav" style="color:#58a6ff">admin panel</a>.</li>
+    <li>On the client, run the installer with the key and a unique device-id:
+      <pre style="background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:8px;margin:6px 0;font-size:12px;color:#d2a8ff;overflow-x:auto">curl -sSL https://raw.githubusercontent.com/klan1/klan1-tunnel/main/install.sh \\
+  | bash -s -- --device-id &lt;name&gt; --api-url &lt;api-url&gt; --api-key &lt;key&gt;</pre>
+    </li>
+    <li>The server assigns a free port from the 65081-65090 range and writes the Caddy vhost automatically.</li>
+  </ol>
+  <p style="margin:0;color:#6e7681;font-size:12px">
+    Active tunnels appear in the table below. Use the action column to extend, fetch the SSH command, or release.
+  </p>
 </div>"""
 
     filter_input = f"""
@@ -2556,7 +2273,7 @@ def main():
     ap.add_argument("--bind", default="0.0.0.0")
     ap.add_argument("--state", default="/var/lib/klan1-tunnel/state.json")
     ap.add_argument("--key-dir", default="/etc/klan1-tunnel",
-                    help="Directory holding jwt-{private,public}.pem and devices.json")
+                    help="Directory holding jwt-{private,public}.pem and api-keys.json (v1 devices.json is no longer read)")
     ap.add_argument("--port-lo", type=int, default=DEFAULT_PORT_RANGE_START)
     ap.add_argument("--port-hi", type=int, default=DEFAULT_PORT_RANGE_END)
     ap.add_argument("--default-ttl", type=int, default=DEFAULT_TTL_SECONDS)
