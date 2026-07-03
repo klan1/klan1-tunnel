@@ -1,441 +1,248 @@
-# Installing klan1-tunnel
+# Server install (admin)
 
-A practical guide to going from "empty box" to "tunnel running" on each
-supported platform. The **one-liner** at the top is the fast path; the
-rest of the document explains what it does and how to fix it when it
-fails on a fresh box (your Chromebook, a server with no Python, a Mac
-without Homebrew, etc.).
+This is the longer form of the README "Quick start (for the
+server admin)" section. It assumes you're running on a fresh
+Ubuntu/Debian box with `root` (or sudo) access.
 
-> **TL;DR for any Linux box with `sudo` and `curl`:**
-> ```bash
-> curl -sSL https://raw.githubusercontent.com/klan1/klan1-tunnel/main/install.sh | \
->     bash -s -- --name mydevice --subdomain 1
-> ```
-> The installer will prompt for the 5 values of `fleet.json` (SSH
-> host/user/port, API URL, base domain) on first run. On a non-TTY
-> pipe (e.g. over SSH), pass `--fleet PATH` to a pre-built config or
-> `--non-interactive` to abort cleanly. See [§1.3](#13-running-the-one-liner).
+## 1. Pick a domain + DNS
 
-## Table of contents
+You need a base domain (e.g. `tunnels.example.com`) under your
+control. Point the wildcard `*.tunnels.example.com` at the public
+IP of the server. (We use Cloudflare for DNS but any provider
+works as long as you can set an A record.)
 
-- [1. Linux (Debian / Ubuntu / Fedora / Arch)](#1-linux)
-  - [1.1 What you need first](#11-what-you-need-first)
-  - [1.2 Installing Python 3 and pip](#12-installing-python-3-and-pip)
-  - [1.3 Running the one-liner](#13-running-the-one-liner)
-  - [1.4 What the one-liner does (and where things go)](#14-what-the-one-liner-does)
-  - [1.5 Verification](#15-verification)
-- [2. macOS (Sonoma+, with or without Homebrew)](#2-macos)
-- [3. Chromebook (Crostini Linux)](#3-chromebook)
-- [4. Headless / no-`sudo` Linux containers](#4-headless)
-- [5. Troubleshooting](#5-troubleshooting)
-
----
-
-<a id="1-linux"></a>
-## 1. Linux (Debian / Ubuntu / Fedora / Arch)
-
-This is the primary path. Tested on Debian Bullseye/Bookworm, Ubuntu
-LTS, Fedora, and Arch. Works on Chromebook Crostini containers too
-(they look like a normal Debian box from `apt`'s point of view).
-
-### 1.1 What you need first
-
-A user account with `sudo` access and a working internet connection.
-That's it. The installer takes care of everything else.
-
-If you are **not** sure whether you have `sudo`, run:
-
-```bash
-sudo -n true && echo "have sudo" || echo "no sudo"
+```sh
+# In your DNS provider:
+*.tunnels.example.com  A  <server-public-ip>
+tunnels.example.com    A  <server-public-ip>     # for the API
+api.tunnels.example.com A <server-public-ip>     # (or CNAME to tunnels.)
 ```
 
-If you see "no sudo" but you are the only user on the box, see
-[§4 Headless / no-`sudo` Linux containers](#4-headless).
+## 2. Install Caddy + cloudflare plugin
 
-### 1.2 Installing Python 3 and pip
-
-Pick your distribution. Each block is the minimum needed before the
-`klan1-tunnel` one-liner can run. The `klan1-tunnel` installer will
-also run these for you, but it's useful to know which package is
-which.
-
-**Debian / Ubuntu / Raspberry Pi OS / Linux Mint / Pop!_OS**
-
-```bash
+```sh
+sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | \
+    sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/xcaddy/gpg.key' | \
+    sudo gpg --dearmor -o /usr/share/keyrings/caddy-xcaddy-archive-keyring.gpg
+. /etc/os-release
+echo "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] \
+    https://dl.cloudsmith.io/deb/caddy/stable/any-version/deb/debian any-version main" | \
+    sudo tee /etc/apt/sources.list.d/caddy-stable.list
 sudo apt update
-sudo apt install -y python3 python3-pip python3-venv autossh openssh-client curl
+sudo apt install caddy
+
+# Build xcaddy with the cloudflare DNS module
+sudo apt install -y golang-go
+go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+~/go/bin/xcaddy build --with github.com/caddy-dns/cloudflare
+sudo cp caddy /usr/local/bin/caddy
 ```
 
-Verify:
+## 3. Cloudflare DNS token
 
-```bash
-python3 --version      # expect Python 3.9 or newer
-python3 -m pip --version
+Caddy needs an API token with `Zone.DNS:Edit` for
+`tunnels.example.com`. Create one at
+<https://dash.cloudflare.com/profile/api-tokens> (use the
+"Edit zone DNS" template). Save the token to a file on the
+server:
+
+```sh
+sudo install -d -m 0700 /etc/klan1-tunnel
+echo -n 'cfat_your_token_here' | sudo tee /etc/klan1-tunnel/caddy-dns-token
+sudo chmod 600 /etc/klan1-tunnel/caddy-dns-token
 ```
 
-**Fedora / RHEL / Rocky / Alma (8+)**
+## 4. Caddy config
 
-```bash
-sudo dnf install -y python3 python3-pip python3-virtualenv autossh openssh-clients curl
+Edit `/etc/caddy/Caddyfile` so it serves the API endpoint and
+imports the dynamic tunnels slice:
+
+```caddyfile
+# /etc/caddy/Caddyfile
+api.tunnels.example.com {
+    tls {
+        dns cloudflare {file=/etc/klan1-tunnel/caddy-dns-token}
+    }
+    reverse_proxy 127.0.0.1:65500
+}
+
+# Wildcard for the dynamic tunnel vhosts
+*.tunnels.example.com, tunnels.example.com {
+    tls {
+        dns cloudflare {file=/etc/klan1-tunnel/caddy-dns-token}
+    }
+    @apitunnel host api.tunnels.example.com
+    handle @apitunnel {
+        abort
+    }
+    import /etc/caddy/Caddyfile.klan1-tunnel
+}
 ```
 
-**Arch / Manjaro**
+`/etc/caddy/Caddyfile.klan1-tunnel` is generated automatically by
+the server on every provision / release. Don't edit it by hand.
 
-```bash
-sudo pacman -Sy --noconfirm python python-pip autossh openssh curl
+## 5. Install the klan1-tunnel server
+
+```sh
+sudo install -d -m 0755 /usr/local/bin
+sudo curl -sSL -o /usr/local/bin/klan1-tunnel-server.py \
+    https://raw.githubusercontent.com/klan1/klan1-tunnel/main/server/klan1-tunnel-server.py
+sudo chmod 755 /usr/local/bin/klan1-tunnel-server.py
 ```
 
-**Alpine (very small containers, edge cases)**
+Install the tunnel shell (used by per-device unix users):
 
-```bash
-sudo apk add --no-cache python3 py3-pip py3-virtualenv autossh openssh-client curl bash
+```sh
+sudo curl -sSL -o /usr/local/bin/tunnel-shell.sh \
+    https://raw.githubusercontent.com/klan1/klan1-tunnel/main/server/tunnel-shell.sh
+sudo chmod 755 /usr/local/bin/tunnel-shell.sh
 ```
 
-> **Why Python 3.9+?** The `klan1-pproxy` fork that `klan1-tunnel`
-> depends on drops support for Python 3.6 and 3.7 (both are EOL).
-> Older Debian (Buster, Bullseye) and Ubuntu (18.04, 20.04) ship 3.9
-> in their universe repos as `python3.9` / `python3.11`. If
-> `python3` resolves to 3.7 or older, the installer will tell you and
-> abort. See [§5 Troubleshooting](#5-troubleshooting) for the
-> pyenv-free upgrade path.
+Create the data dirs:
 
-### 1.3 Running the one-liner
+```sh
+sudo install -d -m 0750 -o root -g klan1 /var/lib/klan1-tunnel
+sudo install -d -m 0750 -o root -g klan1 /var/lib/klan1-tunnel/users
+```
 
-Once `python3`, `pip`, and `curl` exist, the one-liner takes over:
+## 6. Systemd unit
 
-**Interactive (TTY available — desktop, laptop, first run on a server):**
+```ini
+# /etc/systemd/system/klan1-tunnel-server.service
+[Unit]
+Description=klan1-tunnel API server (self-hosted ngrok-like)
+After=network.target
 
-```bash
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/klan1-tunnel-server.py \
+    --port 65500 \
+    --bind 127.0.0.1 \
+    --state /var/lib/klan1-tunnel/state.json \
+    --key-dir /etc/klan1-tunnel \
+    --port-lo 65081 \
+    --port-hi 65090 \
+    --default-ttl 86400
+Restart=always
+RestartSec=3
+User=root
+Group=root
+
+# Hardening: /etc is read-only by default; we add it to the writable
+# list because useradd/groupadd need to write /etc/passwd, /etc/group,
+# /etc/shadow, /etc/gshadow. userdel and groupdel also need write.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/klan1-tunnel /etc/klan1-tunnel /etc
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now klan1-tunnel-server
+```
+
+## 7. First-boot admin password
+
+On first boot, the server generates a random `admin` password and
+prints it to stderr. Read it:
+
+```sh
+sudo journalctl -u klan1-tunnel-server -n 50 --no-pager | grep -A2 'FIRST BOOT'
+```
+
+Output looks like:
+
+```
+[admin] FIRST BOOT: generated admin user.
+[admin]   username: admin
+[admin]   password: MbOgEyVtQ5JkPTqIjUYjrDvh
+[admin]   saved to: /etc/klan1-tunnel/dashboard-auth.json (mode 0600)
+```
+
+The password is hashed with bcrypt (cost 10) and saved to
+`/etc/klan1-tunnel/dashboard-auth.json`. To rotate the admin
+password, generate a new bcrypt hash and put it in the file:
+
+```sh
+NEW_HASH=$(python3 -c "import bcrypt; print(bcrypt.hashpw(b'your-new-pw', bcrypt.gensalt(10)).decode())")
+echo "{\"users\": {\"admin\": {\"password_bcrypt\": \"$NEW_HASH\"}}}" | \
+    sudo tee /etc/klan1-tunnel/dashboard-auth.json
+sudo chmod 600 /etc/klan1-tunnel/dashboard-auth.json
+```
+
+## 8. Caddy reload
+
+After the first provision, the server writes the tunnel vhost
+slice to `/etc/caddy/Caddyfile.klan1-tunnel` and reloads Caddy
+(graceful). Watch the journal to confirm:
+
+```sh
+sudo journalctl -u klan1-tunnel-server -f
+# should show:
+#   [caddy] reloaded after add of <device>:<port> (1 active vhost(s))
+```
+
+## 9. Create your first API key
+
+Open `https://api.tunnels.example.com/dashboard/admin` in a
+browser. The browser will pop the HTTP Basic auth dialog — use
+the `admin` / `<generated-password>` from step 7. From the admin
+page, create a key (e.g. for `macbook`), copy the secret (it's
+shown exactly once), and hand it to the device owner along with
+your API URL (`https://api.tunnels.example.com`) and the
+`device_id` (`macbook`).
+
+## 10. The client runs the installer
+
+On the device:
+
+```sh
 curl -sSL https://raw.githubusercontent.com/klan1/klan1-tunnel/main/install.sh | \
-    bash -s -- --name mydevice --subdomain 1
+    bash -s -- \
+    --device-id macbook \
+    --api-url https://api.tunnels.example.com \
+    --api-key "$KEY"
 ```
 
-You'll be prompted for the 5 values of `fleet.json` (only on the first
-run; subsequent runs on the same box reuse `~/.config/klan1-tunnel/fleet.json`):
+That's it. Local port 8080 is now reachable at
+`https://macbook.tunnels.example.com/`.
 
-```text
-SSH host of the tunnel server: tunnel.example.com
-SSH user: tunnel
-SSH port: 22
-API base URL: https://api.tunnel.example.com
-Base domain for subdomains: tunnel.example.com
+## Upgrading
+
+```sh
+sudo systemctl stop klan1-tunnel-server
+sudo curl -sSL -o /usr/local/bin/klan1-tunnel-server.py \
+    https://raw.githubusercontent.com/klan1/klan1-tunnel/main/server/klan1-tunnel-server.py
+sudo systemctl start klan1-tunnel-server
 ```
 
-The example values (`tunnel.example.com`, `tunnel`, `22`) are deliberately
-non-routable — replace them with your real infrastructure. They are
-shown here only to illustrate the prompt shape.
-
-The config is saved with mode `0600` so only your user can read it.
-
-**Non-interactive (CI, `curl | bash` over SSH, scripts):**
-
-```bash
-# 1. Build fleet.json on a box with a TTY (one-time):
-ssh user@ai1 "curl -sSL .../install.sh | bash -s -- --name bootstrap --subdomain 1"
-scp user@ai1:.config/klan1-tunnel/fleet.json /tmp/fleet.json
-
-# 2. Use it on the target box:
-curl -sSL .../install.sh | \
-    bash -s -- --name newbox --subdomain 2 --fleet /tmp/fleet.json --non-interactive
-```
-
-**Install only (no auto-start) — useful for inspecting what landed:**
-
-```bash
-curl -sSL .../install.sh | \
-    bash -s -- --name mydevice --subdomain 1 --no-start
-~/.local/bin/klan1-tunnel start --name mydevice --subdomain 1
-```
-
-Flags (for `install.sh`):
-
-| Flag | What it does | Default |
-|---|---|---|
-| `--name NAME` | Identifier of this tunnel in the dashboard | `$(hostname -s)` |
-| `--subdomain N` | Which of the 10 pilot slots (`1`–`10`); picks a fixed remote port | **required** |
-| `--fleet PATH` | Use a pre-built `fleet.json` (skip interactive prompt) | search in 3 standard locations |
-| `--non-interactive` | Abort with a clear error if `fleet.json` is missing (use under `curl \| bash` over SSH) | off (prompt if needed) |
-| `--prefix DIR` | Where to drop `klan1-tunnel` and the venv | `~/.local` |
-| `--no-start` | Install only; do not open the tunnel | off |
-| `--skip-deps` | Don't `apt install` (you did it manually) | off |
-
-The installer searches for `fleet.json` in this order, using the first
-one it finds:
-
-1. `--fleet PATH` (if given)
-2. `~/.config/klan1-tunnel/fleet.json`
-3. `~/.klan1-tunnel/fleet.json`
-4. `/etc/klan1-tunnel/fleet.json`
-
-If none of those exist and `--non-interactive` was passed, the installer
-aborts with `refusing to prompt. Pass --fleet PATH.` Otherwise it asks
-the 5 questions above and writes a fresh config to
-`~/.config/klan1-tunnel/fleet.json` (mode `0600`).
-
-The installer also fail-fasts if `fleet.json` still contains any
-`<your-...>` placeholder — better than letting `ssh` return
-`Bad port <your-ssh-port>` 30 seconds later.
-
-### 1.4 What the one-liner does (and where things go)
-
-In order, on a fresh Debian box:
-
-1. `apt install -y autossh python3-pip python3-venv openssh-client`
-2. Creates `~/.klan1-tunnel/venv` (a Python venv) and runs
-   `pip install klan1-pproxy` inside it.
-3. Generates `~/.ssh/id_ed25519_<server>` and prints the public key
-   for you to paste into the server's `authorized_keys`.
-4. Downloads `client/klan1-tunnel.sh` to `~/.local/bin/klan1-tunnel`
-   and `chmod +x` it.
-5. Runs `klan1-tunnel start --name <name> --server <server>` in the
-   background.
-
-The venv path matters: on modern Debian/Ubuntu (PEP 668), `pip install`
-without a venv refuses to touch the system Python. The installer
-sidesteps that by always using a venv at `~/.klan1-tunnel/venv`.
-
-### 1.5 Verification
-
-After the installer finishes, the tunnel should be reachable. Three
-quick checks, in order of cheapness:
-
-```bash
-# 1. Local: did the klan1-tunnel background process start?
-~/.local/bin/klan1-tunnel status
-
-# 2. Local: is pproxy actually importable from the venv?
-~/.klan1-tunnel/venv/bin/python3 -c 'import pproxy; print(pproxy.__file__)'
-
-# 3. Remote: does the public IP respond on the remote port?
-curl -x http://127.0.0.1:<remote-port> http://ifconfig.me
-```
-
-If step 3 returns an IP that matches one of the fleet servers' public
-IPs (configured in `config/fleet.example.json`), the tunnel is alive.
-The dashboard at the API URL from your fleet config also lists it.
-
----
-
-<a id="2-macos"></a>
-## 2. macOS (Sonoma+, with or without Homebrew)
-
-**With Homebrew** (the common case):
-
-```bash
-brew install autossh
-python3 -m pip install --user 'klan1-pproxy>=3.0.1'
-# Make sure ~/.config/klan1-tunnel/fleet.json exists (the installer
-# writes it; on macOS the only way to get it is the interactive one-liner
-# from a Terminal with a TTY):
-curl -sSL https://raw.githubusercontent.com/klan1/klan1-tunnel/main/install.sh | \
-    bash -s -- --name mac --subdomain 1 --no-start
-~/.local/bin/klan1-tunnel start --name mac --subdomain 1 --api-url https://api.<your-base-domain>
-```
-
-**Without Homebrew** (rare, but happens on locked-down work Macs):
-
-macOS Sonoma and newer ship `python3` in
-`/usr/bin/python3` (3.9.6 as of Sonoma 14.5). `pip` is not bundled;
-bootstrap it with `ensurepip`:
-
-```bash
-python3 -m ensurepip --upgrade
-python3 -m pip install --user 'klan1-pproxy>=3.0.1'
-```
-
-`autossh` without Homebrew is harder. You have three options:
-
-1. **Use plain `ssh` instead of `autossh`.** The client falls back to
-   `ssh` automatically; you lose automatic restart on disconnect but
-   for a one-shot test it works:
-
-   ```bash
-   ~/.local/bin/klan1-tunnel start --name mac --subdomain 1 --no-autossh
-   ```
-
-   (Verify whether your client version actually has this flag; if not,
-   just point `PATH` away from `autossh` for one run:
-   `PATH=/usr/bin:/bin ~/.local/bin/klan1-tunnel start ...`.)
-
-2. **Install `autossh` from source.** Trivial: `curl -L
-   https://www.harding.motd.ca/autossh/autossh-1.4g.tar.gz | tar xz
-   && cd autossh-1.4g && ./configure && make && sudo make install`.
-
-3. **Install Homebrew.** Honestly the fastest path:
-   <https://brew.sh>.
-
----
-
-<a id="3-chromebook"></a>
-## 3. Chromebook (Crostini Linux)
-
-A Chromebook with Crostini enabled is a Debian (or Fedora) container.
-The Linux section above applies verbatim. The only Chromebook-specific
-quirks:
-
-- **Enable Linux first.** Chrome OS → Settings → Advanced → Developers
-  → Linux development environment → Turn on. Wait ~5 minutes for the
-  container to come up.
-- **Open the Terminal app** (penguin icon). Everything below happens
-  there.
-- **Crostini's default user has `sudo`** (passwordless, in fact).
-  The `sudo` line in §1.1 works as-is.
-- **Storage**: the Linux container has a quota. `klan1-tunnel`
-  itself is tiny (< 5 MB), so this only matters if you also install
-  big pip packages. The default 10 GB is plenty.
-- **Suspend/resume**: when the Chromebook sleeps, Crostini pauses.
-  The tunnel goes down with it. The client will auto-reconnect when
-  you wake the machine; the `klan1-tunnel status` command will show
-  the drop and recovery in the log.
-
-The first-time install (copy-paste in the Crostini terminal):
-
-```bash
-sudo apt update
-sudo apt install -y python3 python3-pip python3-venv autossh openssh-client curl
-curl -sSL https://raw.githubusercontent.com/klan1/klan1-tunnel/main/install.sh | \
-    bash -s -- --name chromebook --subdomain 1
-```
-
-> **If your Chromebook is a managed/enterprise device** that does not
-> allow Linux, you are out of luck with the Crostini path. The only
-> workaround is to use the device's browser as a SOCKS/HTTP client
-> against the tunnel, not run the tunnel on it.
-
----
-
-<a id="4-headless"></a>
-## 4. Headless / no-`sudo` Linux containers
-
-Some environments (locked-down shared servers, minimal containers,
-Kubernetes pods, Codespaces) give you a user account with no `sudo`.
-The `apt install` step in §1.2 will fail with "Permission denied".
-
-The recovery path:
-
-1. **Tell the installer to skip system packages.** You provide your
-   own `python3`/`pip`/`autossh`, however weird the way you got them
-   (Conda, pipx, a tarball, a pre-baked image, etc.):
-
-   ```bash
-   curl -sSL .../install.sh | \
-       bash -s -- --name mydevice --subdomain 1 --skip-deps
-   ```
-
-2. **The venv path is fully user-owned**, so the rest of the
-   installer (creating `~/.klan1-tunnel/venv`, running
-   `pip install klan1-pproxy` inside it) will succeed.
-
-3. **`autossh` without `sudo`**: same deal. If `autossh` is not on
-   `$PATH`, the client falls back to `ssh` (with a warning in
-   `~/.klan1-tunnel/tunnel.log`). You can compile `autossh` from
-   source into `~/bin/` without root, since it has no dynamic
-   dependencies.
-
-4. **Codespaces / Gitpod / similar**: these ship a usable
-   `python3` and `pip` already. You only need `autossh`, which you
-   can install with `apt-get install -y autossh` in a `postCreateCommand`
-   with the right base image.
-
----
-
-<a id="5-troubleshooting"></a>
-## 5. Troubleshooting
-
-### `python3 reports 3.7; need 3.9+`
-
-The klan1-pproxy fork requires Python 3.9 or newer. If your box ships
-3.7 (Debian 10, Ubuntu 18.04, CentOS 7), you have three options:
-
-1. **Use a backports-style newer Python** (Debian):
-   ```bash
-   sudo apt install -y software-properties-common
-   sudo add-apt-repository -y ppa:deadsnakes/ppa   # Ubuntu only
-   sudo apt install -y python3.11 python3.11-venv
-   python3.11 -m venv ~/.klan1-tunnel/venv
-   ~/.klan1-tunnel/venv/bin/pip install 'klan1-pproxy>=3.0.1'
-   ```
-   The installer will pick up `python3.11` automatically on the next
-   run if `~/.klan1-tunnel/venv` already exists.
-
-2. **Tell the installer to use a specific Python** (anywhere):
-   ```bash
-   PYTHON=/usr/local/bin/python3.11
-   $PYTHON -m venv ~/.klan1-tunnel/venv
-   $PYTHON -m pip install 'klan1-pproxy>=3.0.1'
-   ```
-   The installer re-uses the venv if it already has `pproxy`.
-
-3. **Upgrade the OS.** Sometimes the cleanest answer. Debian 10 and
-   CentOS 7 are EOL.
-
-### `externally-managed-environment` from pip
-
-On modern Debian/Ubuntu (post-PEP 668), `pip install` outside a venv
-or `--user` refuses with this error. The installer always uses a venv
-at `~/.klan1-tunnel/venv` and should not hit this. If you do, you
-probably ran `pip install` manually — wrap it in a venv:
-
-```bash
-python3 -m venv ~/.klan1-tunnel/venv
-~/.klan1-tunnel/venv/bin/pip install 'klan1-pproxy>=3.0.1'
-```
-
-### `autossh: command not found` after install
-
-`autossh` is a separate package from `ssh`. On Debian/Ubuntu:
-
-```bash
-sudo apt install -y autossh
-```
-
-On macOS: `brew install autossh`. On Alpine:
-`apk add autossh`.
-
-The client will fall back to plain `ssh` if `autossh` is missing, but
-you lose automatic reconnection on network blips.
-
-### The tunnel starts but `curl -x` from outside returns nothing
-
-Three usual suspects, in order:
-
-1. **Firewall on the tunnel server.** Check that the remote port is
-   actually reachable from the public internet:
-   `nc -vz <your-server-host> <remote-port>`. If it times out, the
-   firewall rules in your `klan1-tunnel` setup did not take effect.
-   Open the port with the appropriate firewall manager
-   (e.g. `ufw allow <remote-port>/tcp` or `iptables -I INPUT -p tcp --dport <remote-port> -j ACCEPT`).
-2. **SSH key not in the server's `authorized_keys`.** The installer
-   prints the public key for you to paste. Re-check on the server:
-   `tail -1 ~/.ssh/authorized_keys` and compare to
-   `cat ~/.ssh/id_ed25519_<server>.pub` on the client.
-3. **The reverse tunnel died because the SSH session died.** Check
-   `~/.klan1-tunnel/tunnel.log`. If you see `Connection reset by
-   peer` in a loop, the server's `MaxStartups` may be saturated.
-   Raise it in `/etc/ssh/sshd_config` on the server and `systemctl
-   reload sshd`.
-
-### `Permission denied (publickey)` on the very first `klan1-tunnel start`
-
-You generated a key, pasted it into the server, but the server still
-rejects. The two usual causes:
-
-- The server's `~/.ssh/authorized_keys` is not mode 600, or the home
-  dir is not mode 700. `sshd` is strict about this.
-- You pasted the wrong key (e.g. the `id_ed25519_ai1` key from your
-  Mac instead of the freshly generated `id_ed25519_ws1`).
-
-Both are fixed in 10 seconds with `chmod 700 ~ && chmod 600
-~/.ssh/authorized_keys` and re-pasting the right `.pub` file.
-
-### Where to look when nothing makes sense
-
-In order of signal:
-
-1. `~/.klan1-tunnel/tunnel.log` — the klan1-tunnel client log.
-2. `~/.klan1-tunnel/<name>.log` — the per-tunnel log (one per
-   `--name`).
-3. The dashboard at your `api_url` (see `config/fleet.example.json`) —
-   shows registered tunnels, their egress IPs, and their TTL.
-4. `journalctl -u klan1-tunnel-server -n 200` on the API server — server-side
-   log.
+The server is stateless except for `state.json` (live tunnels) +
+`api-keys.json` (created keys) + `dashboard-auth.json` (admin
+passwords). Back these up before upgrading.
+
+## Troubleshooting
+
+- **"useradd: cannot lock /etc/group"** — your systemd unit is
+  missing `/etc` from `ReadWritePaths`. Fix the unit, daemon-reload,
+  restart.
+- **"no_free_ports"** — all 10 ports in 65081-65090 are taken.
+  Revoke unused keys (admin page) or wait for heartbeats to expire.
+- **Caddy reload fails with "caddy validate"** — run
+  `caddy validate --config /etc/caddy/Caddyfile` manually to see
+  the error. The server rolls back to the previous working config.
+- **Tunnel gets 502 from Caddy** — the SSH reverse-tunnel from the
+  device dropped. Check the device's `~/.klan1-tunnel/tunnel.log`
+  and `~/.klan1-tunnel/heartbeat.log`. Often it's a firewall
+  blocking the outbound SSH; or the device went to sleep and the
+  SSH session timed out — install `autossh` to auto-reconnect.
+- **Heartbeat says 401** — your JWT expired. Re-run the installer
+  (or have the device re-fetch a JWT every 5 min, which the
+  installer does for you as long as it isn't restarted).

@@ -1,225 +1,192 @@
 # klan1-tunnel
 
-Self-hosted ngrok-like tunneling service. Runs on your own servers,
-exposes your local HTTP/SOCKS proxies or TCP services through stable
-public URLs.
+Self-hosted reverse-tunnel service. One binary on your server, one
+shell command on your machine, and your local services get stable
+public URLs (e.g. `https://macbook.tunnels.example.com/`).
 
-## Why
+- **API keys** (not whitelisted devices) — give a new device a key
+  and it gets a tunnel. Revoke the key and the tunnel is gone.
+- **No subdomain numbers** — `<your-name>.tunnels.example.com` is
+  yours as long as the key is valid.
+- **Caddy reloads dynamically** when tunnels come and go (no
+  cutting existing connections).
+- **Heartbeat-driven sweep** cleans up expired or unreachable
+  tunnels automatically.
 
-* ngrok's free tier is rate-limited and the URL changes every session.
-* cloudflared quick tunnels block `CONNECT` — useless for HTTP/SOCKS proxies.
-* You already have public-facing servers with bandwidth to spare. This
-  repo is the glue: it adds tunnel-as-a-service on top of any fleet you
-  point it at (via `config/fleet.example.json`).
+## Quick start (for the device owner)
 
-## What it does
-
-* Allocates a port in `65082-65300` on a server from your fleet (219 slots).
-* Opens a reverse SSH tunnel from your device's local proxy to that port.
-* Tracks active tunnels in a tiny Python API server (stdlib-only, no deps).
-* Provides a web dashboard for live status.
-* Auto-restarts the tunnel on drop (custom wrapper, not the broken `autossh`).
-* Registers with the API by default; falls back to standalone if API is unreachable.
-
-## Quick start
-
-`klan1-tunnel` is a **client + server pair**. You run the client on every
-device you want to expose, and the server (`klan1-tunnel-server`)
-allocates a public port and tracks your active tunnels on one of your
-own boxes. Before the client can do anything useful, the server has to
-be installed and your device's `device_id` has to be on its whitelist.
-
-The minimum flags are:
-
-| Flag | What it does |
-|---|---|
-| `--name NAME` | Identifier of this tunnel in the dashboard (e.g. `mac`, `iphone`, `chromebook`) |
-| `--subdomain N` | Which of the 10 pilot slots you want (`1`–`10`); each maps to a fixed remote port (e.g. `1.<your-base-domain>` → `65081`) |
-
-### First time on a new device — interactive
-
-If `fleet.json` is **not** already on this machine, the installer will
-ask for 5 values (SSH host/user/port, API URL, base domain) over the
-terminal, save them to `~/.config/klan1-tunnel/fleet.json` (mode 600),
-and continue:
-
-```bash
+```sh
 curl -sSL https://raw.githubusercontent.com/klan1/klan1-tunnel/main/install.sh | \
-    bash -s -- --name mac --subdomain 1
+    bash -s -- \
+    --device-id macbook \
+    --api-url https://api.tunnels.example.com \
+    --api-key "$MY_KEY"
 ```
 
-You'll be prompted for:
+That's it. The installer:
+1. Calls the API with your key, gets a JWT.
+2. Calls the provision endpoint, gets back a private key + SSH
+   command + heartbeat schedule.
+3. Saves `~/.klan1-tunnel/fleet.json` and the private key.
+4. Starts the SSH reverse-tunnel in background.
+5. Starts a heartbeat daemon that keeps the tunnel alive.
 
-```text
-SSH host of the tunnel server: tunnel.example.com
-SSH user: tunnel
-SSH port: 22
-API base URL: https://api.tunnel.example.com
-Base domain for subdomains: tunnel.example.com
-```
+`http://localhost:8080` on your machine is now reachable at
+`https://macbook.tunnels.example.com/`.
 
-The prompts accept defaults (in brackets `[...]` if shown by the
-installer), and you can press Enter to use them — but **always replace
-the example values** (`example.com`, `tunnel`, `22`) with your real
-infrastructure. The defaults shown in the repo are deliberately
-non-routable.
+## Quick start (for the server admin)
 
-### Repeat / CI / non-interactive (`curl | bash` over SSH)
+1. **Pick a domain** you control (we use `tunnels.example.com`).
+2. **Point the wildcard** `*.tunnels.example.com` at your server.
+3. **Install Caddy** + the `cloudflare` plugin (or any other DNS
+   challenge provider you prefer).
+4. **Install the server** (see `INSTALL.md`):
+   ```sh
+   sudo curl -sSL -o /usr/local/bin/klan1-tunnel-server.py \
+       https://raw.githubusercontent.com/klan1/klan1-tunnel/main/server/klan1-tunnel-server.py
+   sudo chmod 755 /usr/local/bin/klan1-tunnel-server.py
+   # (configure systemd unit — see INSTALL.md)
+   sudo systemctl start klan1-tunnel-server
+   ```
+5. **The first boot generates an admin password** and prints it to
+   the server's journal. Read it:
+   ```sh
+   sudo journalctl -u klan1-tunnel-server | grep -i "password:"
+   ```
+6. **Open the admin page** at `https://api.tunnels.example.com/dashboard/admin`
+   and create an API key for each device owner.
 
-If stdin is **not** a TTY (e.g. `curl ... | bash` over SSH), the
-installer will not prompt. Provide a pre-built `fleet.json`:
-
-```bash
-# 1. Build a fleet.json on a box with a TTY (one-time):
-curl -sSL .../install.sh | bash -s -- --name bootstrap --subdomain 1
-
-# 2. Copy the resulting file to the new box:
-scp ~/.config/klan1-tunnel/fleet.json newbox:/tmp/fleet.json
-
-# 3. Then on newbox, run non-interactively:
-curl -sSL .../install.sh | \
-    bash -s -- --name newbox --subdomain 2 --fleet /tmp/fleet.json --non-interactive
-```
-
-Or skip the install start-up entirely with `--no-start` and run
-`klan1-tunnel start` yourself once you've inspected the install.
-
-**Need a deeper walk-through?** See [`INSTALL.md`](./INSTALL.md) — it
-covers the "empty Chromebook" / "no pip" / "no Homebrew" edge cases
-and what to do when the one-liner fails on a fresh box.
-
-### From a clone
-
-```bash
-git clone https://github.com/klan1/klan1-tunnel.git
-cd klan1-tunnel/client
-./klan1-tunnel.sh start --name mac --subdomain 1 \
-    --api-url https://api.<your-base-domain> --remote-port 65081
-```
-
-> The `client/klan1-tunnel.sh` script reads `fleet.json` from
-> `~/.config/klan1-tunnel/fleet.json` or the path given by `--fleet`.
-> The `install.sh` one-liner does the same search.
-
-## Usage
-
-```text
-klan1-tunnel.sh <action> [options]
-
-Actions:
-  start                  open a tunnel (default)
-  stop --name NAME       stop a specific tunnel
-  status                 list active tunnels
-
-Options for start:
-  --name NAME            tunnel name (e.g. mac, iphone, chromebook)
-  --subdomain N          which of the 10 pilot slots (1..10; maps to
-                         a fixed remote port via fleet.json subdomains)
-  --api-url URL          register with the klan1-tunnel-server API
-                         (default: from fleet.json → https://<your-api-host>)
-  --port PORT            local proxy port (default: same as remote)
-  --remote-port PORT     explicit remote port (overrides --subdomain)
-  --protocol http|socks5 proxy protocol (default: http)
-  --no-proxy             tunnel raw TCP (expose a local web server)
-  --local-target H:P     target when --no-proxy (default: 127.0.0.1:80)
-  --ttl SECONDS          TTL (default: 86400)
-  --egress-ip IP         override the detected egress IP
-```
-
-`install.sh` adds these on top:
-
-```text
-  --fleet PATH           path to a pre-built fleet.json (skips interactive prompt)
-  --prefix DIR           where to drop the binary and venv (default: ~/.local)
-  --no-start             install only; do not open the tunnel
-  --skip-deps            don't install system packages
-  --non-interactive      abort with a clear error if fleet.json is missing
-                         (use this under `curl | bash` over SSH)
-```
+That's it. Give the device owner their `device_id` + the
+`api_url` + the `api_key` (the secret is shown exactly once after
+creation). They run the curl command above.
 
 ## Architecture
 
 ```
-┌────────────────┐     SSH-R-tunnel     ┌──────────────────────────┐
-│  Your device   │                       │  Tunnel server (primary)  │
-│  ─────────     │                       │  ─────────               │
-│  pproxy  ──────┼────── :65082 ─────────▶  sshd listener 65082     │
-│  (socks5/http) │                       │  public IP: <fleet.host> │
-└────────────────┘                       └──────────────────────────┘
-                                                       ▲
-                                                       │
-                                              klan1-tunnel-server
-                                              (port 65500, systemd)
-                                                       │
-                                                       ▼
-                                              web dashboard
-                                              <fleet.api_url>/
+┌──────────┐                ┌─────────────────────────┐
+│  Your    │  -R 65081:8080 │       Server (Caddy)    │
+│  laptop  │  ─────────────►│  *.tunnels.example.com  │
+│ :8080    │   SSH reverse  │                         │
+└──────────┘   tunnel       │  ┌────────────────────┐ │
+     ▲                       │  │ klan1-tunnel-server│ │
+     │                       │  │  (API + dashboard) │ │
+     │                       │  └────────────────────┘ │
+     │ HTTPS                 └────────────┬────────────┘
+     │ /api/v1/tunnels/...                 │
+     │ /api/v1/auth/login ...              │
+     │                                     ▼
+     │                       ┌──────────────────────────┐
+     └───────────────────────│  Cloudflare (DNS + TLS)  │
+         heartbeat           └──────────────────────────┘
+         (every 30s)
 ```
 
-## Endpoints (API server)
+- Your laptop opens an outbound SSH reverse-tunnel to the server.
+  The server accepts the connection as user `tunnel-<port>` (e.g.
+  `tunnel-65081`) and binds port 65081 locally.
+- Caddy terminates TLS at `*.tunnels.example.com` (DNS-01 challenge
+  via Cloudflare) and reverse-proxies the matching host to the
+  right tunnel-`<port>`.
+- Your laptop sends a heartbeat every 30s. If the server doesn't
+  hear from you for >24h (or your API key is revoked), the
+  sweeper kills your tunnel user and removes the Caddy vhost.
 
-| Method | Path | Purpose |
-|---|---|---|
-| `GET`  | `/` | web dashboard |
-| `GET`  | `/healthz` | liveness |
-| `GET`  | `/api/v1/tunnels` | list active tunnels |
-| `GET`  | `/api/v1/free-port` | suggest next free port |
-| `POST` | `/api/v1/tunnels` | register a tunnel, get a token |
-| `POST` | `/api/v1/tunnels/<token>/heartbeat` | extend TTL |
-| `DELETE` | `/api/v1/tunnels/<token>` | release the tunnel |
+## API
 
-## Files
+All endpoints expect JSON bodies and return JSON. Auth is either
+**HTTP Bearer JWT** (for client endpoints) or **HTTP Basic** (for
+admin endpoints).
+
+### Client endpoints (JWT)
 
 ```
-klan1-tunnel/
-├── README.md                  this file
-├── LICENSE                    MIT
-├── install.sh                 one-liner installer (curl | bash)
-├── client/
-│   └── klan1-tunnel.sh        the client (bash, no deps)
-└── server/
-    ├── klan1-tunnel-server.py     the API server (Python 3.6+ stdlib)
-    └── klan1-tunnel-server.service    systemd unit
+POST /api/v1/auth/login
+  body: {device_id, api_key}            # v2 — uses API key, no whitelist
+                                        # v1 (deprecated): device_id only
+  resp: {token, device_id, key_id?, expires_in}
+
+POST /api/v1/devices/<device_id>/provision
+  headers: Authorization: Bearer <jwt>
+  body: {local_port?}                   # default 8080
+  resp: 200 with full bundle:
+    {device_id, tunnel_user, tunnel_port, fqdn, ssh_host,
+     ssh_user, ssh_port, private_key, ssh_command, expires_at,
+     token, caddy_reload_ok}
+    OR 409 name_in_use / 503 no_free_ports / 401 invalid jwt
+
+POST /api/v1/tunnels/<token>/heartbeat
+  headers: Authorization: Bearer <jwt>
+  body: {} (empty)
+  resp: 200 with tunnel entry, OR 401 invalid jwt
+
+GET /api/v1/tunnels
+  resp: {tunnels: [...], count: N}
+
+GET /api/v1/devices
+  resp: {devices: [...]}                # v1 whitelist (legacy)
+
+GET /api/v1/free-port
+  resp: {port, range: [lo, hi]}
 ```
 
-## Server setup (one-time, on `ws1`)
+### Admin endpoints (HTTP Basic)
 
-```bash
-# 1. Firewall: open 65500 (API) and 65082-65300 (tunnels)
-iptables -I INPUT -p tcp --dport 65500 -j ACCEPT
-iptables -I INPUT -p tcp --dport 65082:65300 -j ACCEPT
-
-# 2. SSH: enable GatewayPorts so reverse tunnels bind on 0.0.0.0
-sed -i 's/^#GatewayPorts no/GatewayPorts yes/' /etc/ssh/sshd_config
-systemctl reload sshd
-
-# 3. Install the server
-cp server/klan1-tunnel-server.py /usr/local/bin/
-cp server/klan1-tunnel-server.service /etc/systemd/system/
-mkdir -p /var/lib/klan1-tunnel /var/log/klan1-tunnel
-systemctl daemon-reload
-systemctl enable --now klan1-tunnel-server
+```
+GET    /api/v1/keys              # list (no secrets, no hashes)
+POST   /api/v1/keys              # create: {name, ttl_seconds?}  -> 201 {id, secret, ...}
+DELETE /api/v1/keys/<id>         # revoke (idempotent)
+GET    /dashboard/admin          # HTML page: API keys + devices
 ```
 
-## Client setup (per device)
+### Health
 
-```bash
-# macOS (with Homebrew) — uses the system python3; no pyenv, no pipx
-brew install autossh
-python3 -m pip install --user 'klan1-pproxy>=3.0.1'
-
-# Chromebook / Linux — one-shot install script handles everything
-curl -sSL https://raw.githubusercontent.com/klan1/klan1-tunnel/main/install.sh | bash -s -- --name mydevice
+```
+GET /healthz                       # {ok: true, time: ...}
 ```
 
-> **pproxy version**: the `klan1-pproxy` package on PyPI is the
-> maintained fork of `pproxy` and requires Python 3.9 or newer. It
-> works with the python3 that ships with macOS Sonoma+ and
-> Debian 12 / Ubuntu 22.04+. We install into a per-user virtualenv at
-> `~/.local/share/klan1-tunnel/venv` (or `--user` site-packages on
-> macOS) so the system Python stays clean. See [`INSTALL.md`](./INSTALL.md)
-> for the full walk-through.
+## Configuration
+
+The server reads `/etc/klan1-tunnel/fleet.json` (overridable via
+`/etc/klan1-tunnel/fleet.json` on the server, or
+`~/.klan1-tunnel/fleet.json` on the client):
+
+```json
+{
+  "base_domain": "tunnels.example.com",
+  "api_host": "api.tunnels.example.com"
+}
+```
+
+The Cloudflare DNS token (for Caddy TLS) lives in
+`/etc/klan1-tunnel/caddy-dns-token` (mode 0600). The admin
+passwords live in `/etc/klan1-tunnel/dashboard-auth.json` (mode
+0600, bcrypt-hashed).
+
+The server uses `/var/lib/klan1-tunnel/state.json` for the live
+tunnel state and `/etc/klan1-tunnel/api-keys.json` for the API
+keys store. The systemd unit is hardened (ProtectSystem=strict,
+ReadWritePaths=`/var/lib/klan1-tunnel /etc/klan1-tunnel /etc`).
+
+## Limits
+
+- 10 ports (65081-65090). First-fit allocation.
+- Default TTL: 24h, extended by heartbeats (sliding).
+- Key TTL: configurable per key (1h .. 1y, or never).
+- Sweeper runs every 30s.
+
+## Development
+
+`server/klan1-tunnel-server.py` is a single-file Python 3.9+
+service with no third-party deps beyond PyJWT and (optionally)
+bcrypt. The admin and client share no auth model: the admin
+endpoints are gated by HTTP Basic; the client endpoints are
+gated by JWT.
+
+The installer is a single bash script that talks to the API
+directly with `curl` + `python3 -c "import json, ..."`. No
+external tools required beyond `bash`, `curl`, `python3`, and
+`ssh` (autossh optional).
 
 ## License
 
-MIT.
+Pick something appropriate; not yet specified.
