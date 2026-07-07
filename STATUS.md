@@ -52,13 +52,14 @@ is NOT in this repo — it's installed at the OS level on the VPS.
   the keys from earlier verification — ok to delete for a clean
   start, or just create new ones from the admin page).
 - The server code at `/usr/local/bin/klan1-tunnel-server.py` on
-  ai1 is at commit `03898dc` (the last v1+v2 dual-mode commit).
-  Commits `53259ab` (docs), `b635bd5` (BREAKING cutover), and
-  `268cb73` (MIGRATION.md) are on `main` but have NOT been
-  deployed to ai1. The next `systemctl restart` will pick them
-  up — and at that point, the v1 endpoints stop responding.
-  If you have active v1 tunnels on ai1, follow MIGRATION.md
-  phase 1+2+3 before deploying.
+  ai1 is at commit `3161785` (the last v1+v2 dual-mode commit).
+  Commits `422afaf` (docs), `614fd69` (BREAKING cutover),
+  `e2b7135` (MIGRATION.md), and `f791971` (scrub) are on
+  `main` but have NOT been deployed to ai1. The next
+  `systemctl restart` will pick them up — and at that point,
+  the v1 endpoints stop responding. If you have active v1
+  tunnels on ai1, follow MIGRATION.md phase 1+2+3 before
+  deploying.
 
 ### Repo state
 
@@ -67,7 +68,7 @@ is NOT in this repo — it's installed at the OS level on the VPS.
 - Remote: `github.com:klan1/klan1-tunnel` (note: `klan1` not
   `klan1-tunnel` as user; the repo is the `klan1-tunnel` repo
   under the `klan1` org).
-- HEAD on main is `268cb73`. Working tree has:
+- HEAD on main is `f791971`. Working tree has:
   - Modified (NOT committed): none as of 2026-07-03.
   - Untracked: `config/fleet.json` (the local fleet file,
     `.gitignore`d on purpose; never to be committed).
@@ -95,20 +96,20 @@ All 7 commits are pushed to `main` and deployed on ai1.
 
 | # | SHA | Commit |
 |---|---|---|
-| 1 | `f95c7dc` | `feat(server): APIKeyStore for v2 (bcrypt + pbkdf2 fallback)` |
-| 2 | `3cef248` | `feat(server): v2 auth — login with api_key + keys CRUD` |
-| 3 | `bcaecef` | `feat(server): v2 provision endpoint — POST /api/v1/devices/<id>/provision` |
-| 3b | `f43d4f3` | `fix(server): APIKeyStore reloads from disk on mtime change` |
-| 4 | `e0b0902` | `feat(server): Caddyfile generator + dry-run + reload` |
-| 5 | `25520dd` | `feat(server): sweeper cleans up expired + revoked-key tunnels` |
-| 5b | `a4130ff` | `fix(server): State._maybe_reload` |
-| 6 | `0088992` | `feat(client): installer v2 — device-id + api-key flow` |
-| 7 | `4308dd5` | `feat(server): basicauth + admin dashboard` |
-| 7b | `62599e9` | `fix(server): move GET /api/v1/keys from do_POST to do_GET` |
-| 7c | `03898dc` | `fix(server): move DELETE /api/v1/keys/<id> from do_POST to do_DELETE` |
-| 8 | `53259ab` | `docs: STATUS.md + v2 README/INSTALL + PLAN-V2 banner` |
-| 9 | `b635bd5` | `BREAKING(server): cutover v1 → v2 — remove subdomain + whitelist paths` |
-| 10 | `268cb73` | `docs: MIGRATION.md playbook for the v1 → v2 cutover` |
+| 1 | `95cb2d0` | `feat(server): APIKeyStore for v2 (bcrypt + pbkdf2 fallback)` |
+| 2 | `c5ca26d` | `feat(server): v2 auth — login with api_key + keys CRUD` |
+| 3 | `8291a16` | `feat(server): v2 provision endpoint — POST /api/v1/devices/<id>/provision` |
+| 3b | `4924bfb` | `fix(server): APIKeyStore reloads from disk on mtime change` |
+| 4 | `11d5564` | `feat(server): Caddyfile generator + dry-run + reload` |
+| 5 | `03f9228` | `feat(server): sweeper cleans up expired + revoked-key tunnels` |
+| 5b | `e9fb713` | `fix(server): State._maybe_reload` |
+| 6 | `3b49ea1` | `feat(client): installer v2 — device-id + api-key flow` |
+| 7 | `4772ee0` | `feat(server): basicauth + admin dashboard` |
+| 7b | `a7b07be` | `fix(server): move GET /api/v1/keys from do_POST to do_GET` |
+| 7c | `3161785` | `fix(server): move DELETE /api/v1/keys/<id> from do_POST to do_DELETE` |
+| 8 | `422afaf` | `docs: STATUS.md + v2 README/INSTALL + PLAN-V2 banner` |
+| 9 | `614fd69` | `BREAKING(server): cutover v1 → v2 — remove subdomain + whitelist paths` |
+| 10 | `e2b7135` | `docs: MIGRATION.md playbook for the v1 → v2 cutover` |
 
 The full commit-by-commit plan is in `PLAN-V2.md` (now tracked
 in the repo as a historical reference).
@@ -136,12 +137,12 @@ in the repo as a historical reference).
 
 ### What is NOT done
 
-- **Commit 8** (docs): DONE at `53259ab`. `README.md`,
+- **Commit 8** (docs): DONE at `422afaf`. `README.md`,
   `INSTALL.md`, and `deploy/SIGUIENTE-PASO.md` are all in
   English, scrubbed of real infrastructure (all references use
   `<placeholder>` form). Uses placeholders like
   `tunnels.example.com`, `api.tunnels.example.com`.
-- **Commit 9** (BREAKING cutover v1 → v2): DONE at `b635bd5`.
+- **Commit 9** (BREAKING cutover v1 → v2): DONE at `614fd69`.
   All v1 code paths removed: `SUBDOMAIN_PORTS`, the
   `provision_tunnel_user` / `_provision_tunnel_user_locked`
   functions, the v1 `/api/v1/devices` GET endpoint, the v1
@@ -157,7 +158,7 @@ in the repo as a historical reference).
   same 30s interval). `Auth.login` was renamed to
   `issue_token_for_key` (more descriptive of what it does in
   v2). Server went from 2639 → 2356 lines (-283).
-- **Commit 10** (migration runbook): DONE at `268cb73`.
+- **Commit 10** (migration runbook): DONE at `e2b7135`.
   `MIGRATION.md` at the repo root. Step-by-step runbook for
   cutting over a live v1 server to v2, with rollback
   procedures, smoke tests, and FAQ.
@@ -216,7 +217,7 @@ klan1-tunnel/
 ├── README.md                      (v2, EN, scrubbed; not yet committed)
 ├── INSTALL.md                     (v2, EN, scrubbed; not yet committed)
 ├── PLAN-V2.md                     (the 10-commit plan; not yet committed)
-├── install.sh                     (v2 installer; committed at 0088992)
+├── install.sh                     (v2 installer; committed at 3b49ea1)
 ├── deploy/
 │   ├── SIGUIENTE-PASO.md          (placeholder; not yet committed)
 │   └── klan1-tunnel-server.service (systemd unit template; committed)
@@ -382,7 +383,7 @@ Note `ReadWritePaths=/etc`: the server runs as root and needs to
 `/etc/shadow`, `/etc/gshadow`. If you drop the `/etc` from
 ReadWritePaths, **provisions will fail with `useradd: cannot
 lock /etc/group`**. This is a real bug we hit on ai1
-(fix commit: `6f97cae`). Do not regress it.
+(fix commit: `7ff1ac7`). Do not regress it.
 
 The server also needs `/usr/sbin/useradd`, `/usr/sbin/groupadd`,
 `/usr/sbin/userdel`, `/usr/sbin/groupdel`, `ssh-keygen` on PATH.
@@ -415,7 +416,7 @@ not re-litigate them without checking in.
 | D7 | Caddy reload dynamic, not wildcard | User chose this. Dry-run before reload. |
 | D8 | Implicit release on missing heartbeat | Server already has `default-ttl=86400`. |
 | D9 | Big-bang cutover (no v1/v2 coexistence) | User chose this. |
-| D10 | v1 endpoints kept through commit 8, removed in commit 9 (DONE at b635bd5) | For smooth rollout. |
+| D10 | v1 endpoints kept through commit 8, removed in commit 9 (DONE at 614fd69) | For smooth rollout. |
 | D11 | Use `Optional[int]`, not `int \| None` | Python 3.9 compat. |
 | D12 | Hash format: `pbkdf2_sha256$<iters>$<salt_b64>$<dk_hex>` | Passlib-style, self-describing. |
 | D13 | ad-hoc verification with `tempfile.mkstemp` | Compliance with the agent's system rule to verify local disk changes. |
@@ -497,20 +498,20 @@ command output.
 
 | # | SHA | Title | Status |
 |---|---|---|---|
-| 1 | `f95c7dc` | `feat(server): APIKeyStore for v2` | done |
-| 2 | `3cef248` | `feat(server): v2 auth — login with api_key + keys CRUD` | done |
-| 3 | `bcaecef` | `feat(server): v2 provision endpoint` | done |
-| 3b | `f43d4f3` | `fix(server): APIKeyStore reloads on mtime change` | done |
-| 4 | `e0b0902` | `feat(server): Caddyfile generator + dry-run + reload` | done |
-| 5 | `25520dd` | `feat(server): sweeper cleans up expired + revoked-key tunnels` | done |
-| 5b | `a4130ff` | `fix(server): State._maybe_reload` | done |
-| 6 | `0088992` | `feat(client): installer v2` | done |
-| 7 | `4308dd5` | `feat(server): basicauth + admin dashboard` | done |
-| 7b | `62599e9` | `fix(server): move GET /api/v1/keys to do_GET` | done |
-| 7c | `03898dc` | `fix(server): move DELETE /api/v1/keys to do_DELETE` | done |
-| 8 | `53259ab` | `docs: STATUS.md + v2 README/INSTALL + PLAN-V2 banner` | done |
-| 9 | `b635bd5` | `BREAKING(server): cutover v1 → v2 — remove subdomain + whitelist paths` | done |
-| 10 | `268cb73` | `docs: MIGRATION.md playbook for the v1 → v2 cutover` | done |
+| 1 | `95cb2d0` | `feat(server): APIKeyStore for v2` | done |
+| 2 | `c5ca26d` | `feat(server): v2 auth — login with api_key + keys CRUD` | done |
+| 3 | `8291a16` | `feat(server): v2 provision endpoint` | done |
+| 3b | `4924bfb` | `fix(server): APIKeyStore reloads on mtime change` | done |
+| 4 | `11d5564` | `feat(server): Caddyfile generator + dry-run + reload` | done |
+| 5 | `03f9228` | `feat(server): sweeper cleans up expired + revoked-key tunnels` | done |
+| 5b | `e9fb713` | `fix(server): State._maybe_reload` | done |
+| 6 | `3b49ea1` | `feat(client): installer v2` | done |
+| 7 | `4772ee0` | `feat(server): basicauth + admin dashboard` | done |
+| 7b | `a7b07be` | `fix(server): move GET /api/v1/keys to do_GET` | done |
+| 7c | `3161785` | `fix(server): move DELETE /api/v1/keys to do_DELETE` | done |
+| 8 | `422afaf` | `docs: STATUS.md + v2 README/INSTALL + PLAN-V2 banner` | done |
+| 9 | `614fd69` | `BREAKING(server): cutover v1 → v2 — remove subdomain + whitelist paths` | done |
+| 10 | `e2b7135` | `docs: MIGRATION.md playbook for the v1 → v2 cutover` | done |
 
 The PLAN-V2.md file is kept in the repo (now tracked) as a
 historical reference — the v2 plan from 2026-07-02.

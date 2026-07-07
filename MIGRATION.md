@@ -344,7 +344,7 @@ After Phase 3:
 - **The systemd unit is missing `/etc` from `ReadWritePaths`.**
   Provisions will fail with `useradd: cannot lock /etc/group`.
   Fix the unit, `systemctl daemon-reload`, restart. See
-  `STATUS.md` section 11 pitfall 1 (and commit `6f97cae`).
+  `STATUS.md` section 11 pitfall 1 (and commit `7ff1ac7`).
 - **bcrypt is not installed.** The server falls back to
   pbkdf2_sha256 silently. This is fine, but the API key hashes
   will be in pbkdf2 format, not bcrypt. Both are valid.
@@ -409,17 +409,17 @@ window.
 Between Phase 1 and Phase 3, the server has BOTH v1 and v2
 endpoints live. The relevant commit boundaries are:
 
-- **Commit `bcaecef`** — first v2 endpoint (POST /api/v1/devices/<id>/provision)
+- **Commit `8291a16`** — first v2 endpoint (POST /api/v1/devices/<id>/provision)
   is added. From this commit onward, new tunnels can be created
   via the v2 flow.
-- **Commit `0088992`** — v2 client (`install.sh`) is added.
+- **Commit `3b49ea1`** — v2 client (`install.sh`) is added.
   From this commit onward, clients can install via the v2 flow.
-- **Commit `53259ab`** — docs (commit 8). No code change.
+- **Commit `422afaf`** — docs (commit 8). No code change.
 - **Commit `<sha-of-9>`** — the BREAKING commit. v1 endpoints
   removed. v1 dashboard form removed. v1 `subdomain` field
   gone.
 
-The window is from `bcaecef` (or whenever you deploy the v2
+The window is from `8291a16` (or whenever you deploy the v2
 server) to `<sha-of-9>` (whenever you deploy the BREAKING
 commit). During that window, the server is dual-mode and
 clients can be on either side.
