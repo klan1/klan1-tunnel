@@ -173,7 +173,7 @@ for k in ("device_id", "tunnel_user", "tunnel_port", "ssh_host",
 }
 BUNDLE=$(read_bundle "$PROV_RESP")
 # shellcheck disable=SC2046
-eval $(echo "$BUNDLE" | sed 's/^BASE64:/private_key_b64=/')
+eval $(echo "$BUNDLE" | sed 's/private_key=/private_key_b64=/')
 
 # Decode the private key
 PRIVATE_KEY=$(echo "$private_key_b64" | sed 's/^BASE64://' | base64 -d)
