@@ -146,16 +146,28 @@ GET /healthz                       # {ok: true, time: ...}
 
 ## Configuration
 
-The server reads `/etc/klan1-tunnel/fleet.json` (overridable via
-`/etc/klan1-tunnel/fleet.json` on the server, or
+The server reads its runtime config from `/etc/klan1-tunnel/fleet.json`
+(overridable via the `KLAN1_TUNNEL_CONFIG` env var or
 `~/.klan1-tunnel/fleet.json` on the client):
 
 ```json
 {
-  "base_domain": "tunnels.example.com",
-  "api_host": "api.tunnels.example.com"
+  "servers": {
+    "primary": {
+      "host": "tunnel.example.com",
+      "user": "root",
+      "port": 22
+    }
+  },
+  "server_order": ["primary"],
+  "base_domain": "tunnels.example.com"
 }
 ```
+
+`base_domain` is the wildcard parent domain Caddy serves (e.g.
+`my-mac.tunnels.example.com`). `servers.primary.host` is the SSH
+host clients connect to when establishing the reverse tunnel — the
+same machine the Caddy listens on.
 
 The Cloudflare DNS token (for Caddy TLS) lives in
 `/etc/klan1-tunnel/caddy-dns-token` (mode 0600). The admin
