@@ -165,7 +165,11 @@ for k in ('device_id', 'tunnel_user', 'tunnel_port', 'ssh_host',
         # Pass the key as base64 to avoid shell quoting hell
         import base64
         v = 'BASE64:' + base64.b64encode(v.encode()).decode()
-    print(f'{k}={v}')
+    # Use single-quote escaping for the value: 'foo' with embedded
+    # single quotes becomes 'foo'\''bar'. Safe for any value, even
+    # one containing spaces (like ssh_command).
+    q = \"'\" + v.replace(\"'\", \"'\\\\''\") + \"'\"
+    print(f'{k}={q}')
 " <<< "$1"
 }
 BUNDLE=$(read_bundle "$PROV_RESP")
