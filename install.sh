@@ -301,6 +301,24 @@ echo "config:      $KLAN1_TUNNEL_HOME/fleet.json"
 echo "tunnel log:  $LOG_FILE"
 echo "heartbeat:   $HEARTBEAT_PID (every ${HEARTBEAT_INTERVAL}s)"
 echo
-echo "Test the tunnel: curl -v https://$fqdn/"
-echo "Stop the tunnel: kill $TUNNEL_PID && kill $HEARTBEAT_PID"
+echo "=== Tunnel Status ==="
+echo "✓ SSH tunnel is LIVE and listening on port $tunnel_port at $ssh_host"
+echo "✓ Heartbeat daemon running (status: tail -f $HEARTBEAT_LOG)"
+echo
+echo "=== HTTPS Certificate Status ==="
+echo "⏳ Caddy is issuing TLS certificate for $fqdn via Cloudflare DNS-01"
+echo "   This usually takes 1–3 minutes. During this time:"
+echo "   • HTTPS connections may fail with 'TLS alert internal error'"
+echo "   • This is NORMAL and temporary"
+echo "   • The tunnel is working (HTTP redirects and reverse tunnel are live)"
+echo
+echo "=== Testing ==="
+echo "Wait 2–3 min for cert, then:"
+echo "  curl -I https://$fqdn/        # Check HTTPS"
+echo "  curl http://$fqdn/           # HTTP (redirects to HTTPS)"
+echo "  curl https://api.ipify.org   # Via tunnel (if proxy configured)"
+echo
+echo "=== Logs ==="
+echo "  Tunnel:     tail -f $LOG_FILE"
+echo "  Heartbeat:  tail -f $HEARTBEAT_LOG"
 echo
