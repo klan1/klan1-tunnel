@@ -204,6 +204,13 @@ eval $(echo "$BUNDLE" | sed 's/private_key=/private_key_b64=/')
 # Decode the private key
 PRIVATE_KEY=$(echo "$private_key_b64" | sed 's/^BASE64://' | base64 -d)
 
+# FIXME: API returns ssh_port=22 but should be 65522 (server uses non-standard SSH port)
+# Temporarily override until server API is fixed
+if [[ "$ssh_port" == "22" ]] && [[ "$ssh_host" == *"ai1"* ]]; then
+    log "WARN: API returned ssh_port=22 for ai1, overriding to 65522 (API bug)"
+    ssh_port=65522
+fi
+
 log "provisioned: tunnel=$tunnel_user@$ssh_host:$ssh_port (port $tunnel_port)"
 log "              fqdn=$fqdn expires=$expires_at"
 
