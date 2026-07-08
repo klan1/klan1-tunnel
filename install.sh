@@ -154,24 +154,22 @@ fi
 
 # Extract fields from the bundle
 read_bundle() {
-    python3 -c "
+    python3 -c '
 import json, sys
+import shlex
 d = json.load(sys.stdin)
-for k in ('device_id', 'tunnel_user', 'tunnel_port', 'ssh_host',
-         'ssh_user', 'ssh_port', 'private_key', 'ssh_command',
-         'fqdn', 'token', 'expires_at'):
-    v = d.get(k, '')
-    if k == 'private_key':
+for k in ("device_id", "tunnel_user", "tunnel_port", "ssh_host",
+         "ssh_user", "ssh_port", "private_key", "ssh_command",
+         "fqdn", "token", "expires_at"):
+    v = d.get(k, "")
+    if k == "private_key":
         # Pass the key as base64 to avoid shell quoting hell
         import base64
-        v = 'BASE64:' + base64.b64encode(v.encode()).decode()
-    # Use single-quote escaping for the value: 'foo' with embedded
-    # single quotes becomes 'foo'\''bar'. Safe for any value, even
-    # one containing spaces (like ssh_command). Coerce to str first
-    # because JSON ints and bools would otherwise crash on .replace().
-    q = "'" + str(v).replace("'", "'\\''") + "'"
-    print(f'{k}={q}')
-" <<< "$1"
+        v = "BASE64:" + base64.b64encode(v.encode()).decode()
+    # Use shlex.quote() for safe shell escaping — works for any value
+    q = shlex.quote(str(v))
+    print(f"{k}={q}")
+' <<< "$1"
 }
 BUNDLE=$(read_bundle "$PROV_RESP")
 # shellcheck disable=SC2046
