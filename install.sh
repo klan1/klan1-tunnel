@@ -134,7 +134,16 @@ LOGIN_RESP=$(curl -sS -X POST "$API_URL/api/v1/auth/login" \
     -d "$LOGIN_BODY")
 JWT=$(echo "$LOGIN_RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('token',''))")
 if [[ -z "$JWT" ]]; then
-    err "login failed: $LOGIN_RESP"
+    LOGIN_ERR=$(echo "$LOGIN_RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('error','unknown error'))" 2>/dev/null)
+    case "$LOGIN_ERR" in
+        invalid_api_key)
+            err "Login failed: API key is invalid or expired.
+Check the --api-key argument and try again."
+            ;;
+        *)
+            err "Login failed: $LOGIN_RESP"
+            ;;
+    esac
 fi
 log "logged in, JWT len=${#JWT}"
 
@@ -149,7 +158,24 @@ PROV_RESP=$(curl -sS -X POST "$API_URL/api/v1/devices/$DEVICE_ID/provision" \
     -d "$PROV_BODY")
 PROV_ERR=$(echo "$PROV_RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('error',''))" 2>/dev/null)
 if [[ -n "$PROV_ERR" ]]; then
-    err "provision failed: $PROV_RESP"
+    case "$PROV_ERR" in
+        name_in_use)
+            err "Device '$DEVICE_ID' already exists on server.
+
+To fix:
+  1. Delete existing device (on server):
+     curl -X DELETE https://api.tunnels.klan1.net/api/v1/devices/$DEVICE_ID \\
+       -H 'Authorization: Bearer admin:changeme'
+  2. Clean up locally: rm -rf ~/.klan1-tunnel
+  3. Try again"
+            ;;
+        invalid_api_key)
+            err "API key invalid or expired. Check key and try again."
+            ;;
+        *)
+            err "provision failed: $PROV_RESP"
+            ;;
+    esac
 fi
 
 # Extract fields from the bundle
