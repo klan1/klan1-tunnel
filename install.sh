@@ -128,9 +128,10 @@ command -v autossh >/dev/null 2>&1 || log "autossh not found, will use plain ssh
 # Step 1: login with api_key, get JWT
 # ============================================================================
 log "logging in to $API_URL/api/v1/auth/login"
+LOGIN_BODY=$(printf '{"device_id":"%s","api_key":"%s"}' "$DEVICE_ID" "$API_KEY")
 LOGIN_RESP=$(curl -sS -X POST "$API_URL/api/v1/auth/login" \
     -H "Content-Type: application/json" \
-    -d "$(python3 -c "import json,sys; print(json.dumps({'device_id': sys.argv[1], 'api_key': sys.argv[2]}))" "$DEVICE_ID" "$API_KEY")")
+    -d "$LOGIN_BODY")
 JWT=$(echo "$LOGIN_RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('token',''))")
 if [[ -z "$JWT" ]]; then
     err "login failed: $LOGIN_RESP"
@@ -141,10 +142,11 @@ log "logged in, JWT len=${#JWT}"
 # Step 2: provision the device
 # ============================================================================
 log "provisioning $DEVICE_ID"
+PROV_BODY=$(printf '{"local_port":%d}' "$LOCAL_PORT")
 PROV_RESP=$(curl -sS -X POST "$API_URL/api/v1/devices/$DEVICE_ID/provision" \
     -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $JWT" \
-    -d "$(python3 -c "import json,sys; print(json.dumps({'local_port': int(sys.argv[1])}))" "$LOCAL_PORT")")
+    -H "Authorization: Bearer ***" \
+    -d "$PROV_BODY")
 PROV_ERR=$(echo "$PROV_RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('error',''))" 2>/dev/null)
 if [[ -n "$PROV_ERR" ]]; then
     err "provision failed: $PROV_RESP"
