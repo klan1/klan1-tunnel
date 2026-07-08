@@ -145,7 +145,7 @@ log "provisioning $DEVICE_ID"
 PROV_BODY=$(printf '{"local_port":%d}' "$LOCAL_PORT")
 PROV_RESP=$(curl -sS -X POST "$API_URL/api/v1/devices/$DEVICE_ID/provision" \
     -H "Content-Type: application/json" \
-    -H "Authorization: Bearer ***" \
+    -H "Authorization: Bearer $JWT" \
     -d "$PROV_BODY")
 PROV_ERR=$(echo "$PROV_RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('error',''))" 2>/dev/null)
 if [[ -n "$PROV_ERR" ]]; then
