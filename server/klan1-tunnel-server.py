@@ -400,6 +400,11 @@ class State:
     def reserve(self, name: str, requested_port: int, protocol: str,
                 server_alias: str, egress_ip: str, ttl: int,
                 api_key_id: Optional[str] = None) -> dict:
+        # Reload from disk in case state.json was edited out-of-band
+        # (e.g. an admin cleared stale entries, or another replica
+        # wrote to the same file). Without this, the in-memory copy
+        # returns stale name_in_use errors after the disk was cleared.
+        self._maybe_reload()
         with self._lock:
             # Reject if name already has a live tunnel. We return the full token
             # so the client can re-adopt the tunnel (heartbeat-friendly).
