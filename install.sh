@@ -167,8 +167,9 @@ for k in ('device_id', 'tunnel_user', 'tunnel_port', 'ssh_host',
         v = 'BASE64:' + base64.b64encode(v.encode()).decode()
     # Use single-quote escaping for the value: 'foo' with embedded
     # single quotes becomes 'foo'\''bar'. Safe for any value, even
-    # one containing spaces (like ssh_command).
-    q = \"'\" + v.replace(\"'\", \"'\\\\''\") + \"'\"
+    # one containing spaces (like ssh_command). Coerce to str first
+    # because JSON ints and bools would otherwise crash on .replace().
+    q = "'" + str(v).replace("'", "'\\''") + "'"
     print(f'{k}={q}')
 " <<< "$1"
 }
