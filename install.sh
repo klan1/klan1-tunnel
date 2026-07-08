@@ -209,6 +209,8 @@ PRIVATE_KEY=$(echo "$private_key_b64" | sed 's/^BASE64://' | base64 -d)
 if [[ "$ssh_port" == "22" ]] && [[ "$ssh_host" == *"ai1"* ]]; then
     log "WARN: API returned ssh_port=22 for ai1, overriding to 65522 (API bug)"
     ssh_port=65522
+    # Also fix the ssh_command that was built with port 22
+    ssh_command=$(echo "$ssh_command" | sed 's/ -p 22$/ -p 65522/')
 fi
 
 log "provisioned: tunnel=$tunnel_user@$ssh_host:$ssh_port (port $tunnel_port)"
@@ -347,12 +349,9 @@ echo "   • The tunnel is working (HTTP redirects and reverse tunnel are live)"
 echo
 echo "=== Testing ==="
 echo "Tunnel is forwarding port $tunnel_port -> localhost:$LOCAL_PORT"
+echo ""
 echo "Test via proxy (e.g., tinyproxy on 8888):"
 echo "  curl -v -x http://127.0.0.1:8888 https://api.ipify.org"
-echo "Or test HTTPS directly (wait 2-3 min for cert):"
-echo "  curl -I https://$fqdn/"
-echo
-echo "=== Logs ==="
-echo "  Tunnel:     tail -f $LOG_FILE"
-echo "  Heartbeat:  tail -f $HEARTBEAT_LOG"
-echo
+echo ""
+echo "Check tunnel log:"
+echo "  tail -f $LOG_FILE"
