@@ -59,11 +59,11 @@ log "prefix=$BIN_DIR state=$STATE_DIR"
 # ---------------------------------------------------------------------------
 # Step 2: download the klan1-tunel CLI from the repo
 # ---------------------------------------------------------------------------
-log "downloading klan1-tunel CLI from $REPO_RAW/client/klan1-tunnel.sh"
-TMP="$(mktemp -t klan1-cli.XXXXXX)"
-if ! curl -fsSL --max-time 20 "$REPO_RAW/client/klan1-tunnel.sh" -o "$TMP"; then
+log "downloading klan1-tunel CLI from $REPO_RAW/client/klan1"
+TMP="$(mktemp -t klan1-tunel-cli.XXXXXX)"
+if ! curl -fsSL --max-time 20 "$REPO_RAW/client/klan1" -o "$TMP"; then
     rm -f "$TMP"
-    err "failed to download klan1-tunel CLI from $REPO_RAW/client/klan1-tunnel.sh
+    err "failed to download klan1-tunel CLI from $REPO_RAW/client/klan1
 
 Check your internet connection, or set KLAN1_TUNNEL_REPO_RAW to a mirror."
 fi
