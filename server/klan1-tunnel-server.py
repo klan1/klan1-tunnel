@@ -91,7 +91,7 @@ def _load_runtime_config():
         "/etc/klan1-tunnel/fleet.json",
         os.path.expanduser("~/.klan1-tunnel/fleet.json"),
     ]
-    result = {"base_domain": DEFAULT_BASE_DOMAIN, "api_host": None}
+    result = {"base_domain": DEFAULT_BASE_DOMAIN, "api_host": None, "api_port": None}
     for p in cfg_paths:
         if p and os.path.isfile(p):
             try:
@@ -108,6 +108,9 @@ def _load_runtime_config():
                     host = primary.get("host")
                     if host:
                         result["api_host"] = host
+                    port = primary.get("port")
+                    if port:
+                        result["api_port"] = int(port)
                 break
             except Exception:
                 pass
@@ -119,6 +122,7 @@ BASE_DOMAIN = _RUNTIME["base_domain"]
 # Host clients SSH to for the reverse tunnel. Default placeholder
 # points users at their fleet.json.
 API_HOST = _RUNTIME["api_host"] or os.environ.get("KLAN1_TUNNEL_API_HOST") or "<your-api-server-host>"
+API_PORT = _RUNTIME["api_port"] or int(os.environ.get("KLAN1_TUNNEL_API_PORT") or "22")
 
 
 def now_utc() -> str:
@@ -1573,12 +1577,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             # Build the SSH command the installer will run. The client
             # connects as the per-tunnel user (e.g. tunnel-65081) on the
-            # standard SSH port — the API host + port for the admin
-            # connection is not exposed in the bundle.
+            # SSH port configured for the primary server (API_PORT,
+            # from fleet.json servers.primary.port; default 22).
             ssh_host = API_HOST or "<your-server-host>"
             tunnel_user = prov["user"]
             ssh_user = tunnel_user
-            ssh_port = 22
+            ssh_port = API_PORT
             ssh_cmd = (
                 f"ssh -i ~/.klan1-tunnel/id_ed25519_{tunnel_user} "
                 f"-N -T -R {port}:127.0.0.1:{local_port} "
