@@ -383,6 +383,12 @@ cmd_release() {
     curl -sS -X DELETE -H "Authorization: Bearer $JWT" \
         "$API_URL/api/v1/tunnels/$TOKEN" 2>&1
     echo
+    # Also kill the local tunnel + heartbeat, since the server-side is gone
+    log "stopping local tunnel + heartbeat (server reservation is gone)"
+    pkill -f "while true.*heartbeat" 2>/dev/null || true
+    [[ -f "$HEARTBEAT_PID" ]] && kill "$(cat "$HEARTBEAT_PID" 2>/dev/null)" 2>/dev/null && rm -f "$HEARTBEAT_PID"
+    TUNNEL_USER=$(python3 -c "import json; print(json.load(open('$FLEET')).get('tunnel_user',''))" 2>/dev/null)
+    [[ -n "$TUNNEL_USER" ]] && pkill -f "ssh.*${TUNNEL_USER}@" 2>/dev/null || true
     log "done. fleet.json preserved; next \`klan1-tunel up\` will reprovision."
 }
 
