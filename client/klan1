@@ -1,0 +1,610 @@
+#!/usr/bin/env bash
+# klan1-tunel — unified CLI for klan1-tunnel.
+#
+# Installed at ~/.local/bin/klan1-tunel-tunel by the one-shot installer at
+# https://klan1.net/tunel-install.sh. Persistent — you call this many
+# times, the installer you call once.
+#
+# Subcommands:
+#   init         First-time setup: prompt for device_id / api_key / api_url
+#                and write ~/.klan1-tunnel/config.json.
+#   up           Provision the tunnel (or reuse existing) + start SSH reverse
+#                tunnel + start heartbeat. Idempotent.
+#   down         Stop the SSH tunnel + heartbeat. Does NOT release the
+#                server-side tunnel (use `klan1-tunel release` for that, or
+#                just `klan1-tunel up` will auto-release and re-provision).
+#   release      DELETE the server-side tunnel reservation.
+#   status       Show tunnel + heartbeat + pproxy state.
+#   proxy        Launch pproxy on the local port (http+socks5 on the same
+#                port). Requires `up` to have run first.
+#   logs         tail -f the relevant log (tunnel | heartbeat | pproxy | all).
+#   set          Edit config.json (key, value).
+#   unset        Remove a key from config.json.
+#   show         Print the current config.
+#   path         Print paths to state dir, config, logs, key file.
+#   version      Print the klan1-tunel version + the upstream server status.
+#   help         This help.
+#
+# Config layout (~/.klan1-tunnel/):
+#   config.json     device_id, api_key, api_url, local_port
+#   fleet.json      written by `up` after a successful provision
+#   id_ed25519_*    SSH keypair (server-side authorized_keys)
+#   tunnel.log      SSH reverse-tunnel stdout/stderr
+#   heartbeat.log   one line per 30s heartbeat
+#   heartbeat.pid   PID file
+#   pproxy.log      pproxy stdout/stderr
+#   pproxy.pid      PID file
+#
+# Environment overrides:
+#   KLAN1_TUNNEL_HOME       state dir (default: ~/.klan1-tunnel)
+#   KLAN1_TUNNEL_API_URL    api_url (overrides config.json)
+#   KLAN1_TUNNEL_API_KEY    api_key (overrides config.json; useful in CI)
+
+set -uo pipefail
+
+# ============================================================================
+# Paths and constants
+# ============================================================================
+KLAN1_TUNNEL_HOME="${KLAN1_TUNNEL_HOME:-$HOME/.klan1-tunnel}"
+CONFIG="$KLAN1_TUNNEL_HOME/config.json"
+FLEET="$KLAN1_TUNNEL_HOME/fleet.json"
+HEARTBEAT_PID="$KLAN1_TUNNEL_HOME/heartbeat.pid"
+PPROXY_PID_FILE="$KLAN1_TUNNEL_HOME/pproxy.pid"
+TUNNEL_LOG="$KLAN1_TUNNEL_HOME/tunnel.log"
+HEARTBEAT_LOG="$KLAN1_TUNNEL_HOME/heartbeat.log"
+PPROXY_LOG="$KLAN1_TUNNEL_HOME/pproxy.log"
+PREFIX="${PREFIX:-$HOME/.local}"
+BIN_DIR="$PREFIX/bin"
+
+# Where the legacy script lives (installed by tunel-install.sh as a sibling
+# of this file). Used for `up` / `down` / `status` / `release` since that
+# logic is already there.
+SELF_PATH="${BASH_SOURCE[0]}"
+SELF_DIR="$(cd "$(dirname "$SELF_PATH")" && pwd)"
+LEGACY="$SELF_DIR/klan1-tunnel.sh"
+
+VERSION="0.3.0"
+
+# ============================================================================
+# Helpers
+# ============================================================================
+err()  { echo "[klan1-tunel] ERROR: $*" >&2; exit 1; }
+log()  { echo "[klan1-tunel] $*" >&2; }
+
+require_cmd() {
+    for c in "$@"; do
+        command -v "$c" >/dev/null 2>&1 || err "missing required command: $c"
+    done
+}
+
+# Read a key from config.json (single level or dotted: device_id, local_port, etc.)
+cfg_get() {
+    [[ -f "$CONFIG" ]] || return 1
+    python3 -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+for k in sys.argv[2].split('.'):
+    if not isinstance(d, dict) or k not in d:
+        sys.exit(1)
+    d = d[k]
+print(d)
+" "$CONFIG" "$1" 2>/dev/null
+}
+
+# Write a key=value to config.json
+cfg_set() {
+    [[ -f "$CONFIG" ]] || err "no config yet — run: klan1-tunel init"
+    umask 077
+    python3 -c "
+import json, sys
+path, key, val = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as f:
+    d = json.load(f)
+# Try to coerce the value to its existing type
+existing = d.get(key)
+if isinstance(existing, bool):
+    val = val.lower() in ('1','true','yes','on')
+elif isinstance(existing, int):
+    try:
+        val = int(val)
+    except ValueError:
+        pass
+d[key] = val
+with open(path, 'w') as f:
+    json.dump(d, f, indent=2)
+" "$CONFIG" "$1" "$2"
+}
+
+cfg_unset() {
+    [[ -f "$CONFIG" ]] || err "no config yet"
+    python3 -c "
+import json, sys
+path, key = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    d = json.load(f)
+d.pop(key, None)
+with open(path, 'w') as f:
+    json.dump(d, f, indent=2)
+" "$CONFIG" "$1"
+}
+
+# ============================================================================
+# Subcommand: init
+# ============================================================================
+cmd_init() {
+    if [[ -f "$CONFIG" ]]; then
+        log "config already exists: $CONFIG"
+        log "edit it with: klan1-tunel set <key> <value>"
+        log "or delete it and re-run: rm $CONFIG && klan1-tunel init"
+        cat "$CONFIG"
+        return 0
+    fi
+
+    DEFAULT_API_URL="https://api.tunnels.klan1.net"
+    DEFAULT_LOCAL_PORT="8080"
+
+    if [[ -t 0 ]]; then
+        echo "=== klan1-tunel first-time setup ==="
+        echo
+        read -rp "  API URL  [$DEFAULT_API_URL]: " API_URL
+        API_URL="${API_URL:-$DEFAULT_API_URL}"
+        while true; do
+            read -rp "  device_id (lowercase, e.g. macbook): " DEVICE_ID
+            if [[ "$DEVICE_ID" =~ ^[a-z][a-z0-9-]{0,30}[a-z0-9]$ ]]; then break; fi
+            echo "  invalid (must match ^[a-z][a-z0-9-]{0,30}[a-z0-9]\$)"
+        done
+        read -rp "  api_key (kt1_...): " API_KEY
+        read -rp "  local port  [$DEFAULT_LOCAL_PORT]: " LOCAL_PORT
+        LOCAL_PORT="${LOCAL_PORT:-$DEFAULT_LOCAL_PORT}"
+    else
+        # non-interactive: require env vars
+        : "${API_URL:=$DEFAULT_API_URL}"
+        : "${DEVICE_ID:?set DEVICE_ID env var}"
+        : "${API_KEY:?set API_KEY env var}"
+        : "${LOCAL_PORT:=$DEFAULT_LOCAL_PORT}"
+    fi
+
+    mkdir -p "$KLAN1_TUNNEL_HOME"
+    umask 077
+    cat > "$CONFIG" <<EOF
+{
+  "api_url": "$API_URL",
+  "device_id": "$DEVICE_ID",
+  "api_key": "$API_KEY",
+  "local_port": $LOCAL_PORT
+}
+EOF
+    chmod 600 "$CONFIG"
+    log "wrote $CONFIG (mode 0600)"
+    echo
+    log "next: klan1-tunel up"
+}
+
+# ============================================================================
+# Subcommand: up
+# ============================================================================
+# Provisions the tunnel via the API and starts the SSH reverse-tunnel +
+# heartbeat. Idempotent: if a live tunnel exists for this device_id, reuses
+# it; if a server-side reservation exists but no local SSH, auto-releases
+# and re-provisions.
+cmd_up() {
+    [[ -f "$CONFIG" ]] || err "no config — run: klan1-tunel init"
+    require_cmd curl python3 ssh
+
+    DEVICE_ID=$(cfg_get device_id) || err "config missing device_id"
+    API_URL="${KLAN1_TUNNEL_API_URL:-$(cfg_get api_url)}"
+    API_KEY="${KLAN1_TUNNEL_API_KEY:-$(cfg_get api_key)}"
+    LOCAL_PORT=$(cfg_get local_port)
+    [[ -z "$API_KEY" ]] && err "config missing api_key"
+    [[ -z "$API_URL"  ]] && err "config missing api_url"
+
+    log "device_id=$DEVICE_ID api_url=$API_URL local_port=$LOCAL_PORT"
+
+    # If a live tunnel exists for this device, reuse it
+    TUNNEL_ALIVE=0
+    if [[ -f "$FLEET" ]]; then
+        FLEET_DEVICE=$(python3 -c "import json; print(json.load(open('$FLEET')).get('device_id',''))" 2>/dev/null || echo "")
+        FLEET_USER=$(python3 -c "import json; print(json.load(open('$FLEET')).get('tunnel_user',''))" 2>/dev/null || echo "")
+        if [[ "$FLEET_DEVICE" == "$DEVICE_ID" ]] && pgrep -f "ssh.*${FLEET_USER}@" >/dev/null 2>&1; then
+            log "tunnel already up for $DEVICE_ID (user=$FLEET_USER)"
+            TUNNEL_ALIVE=1
+        fi
+    fi
+
+    if [[ $TUNNEL_ALIVE -eq 0 ]]; then
+        # Login
+        LOGIN_BODY=$(printf '{"device_id":"%s","api_key":"%s"}' "$DEVICE_ID" "$API_KEY")
+        LOGIN_RESP=$(curl -sS -X POST "$API_URL/api/v1/auth/login" \
+            -H "Content-Type: application/json" -d "$LOGIN_BODY")
+        JWT=$(echo "$LOGIN_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('token',''))" 2>/dev/null)
+        [[ -z "$JWT" ]] && err "login failed: $LOGIN_RESP"
+        log "logged in, JWT len=${#JWT}"
+
+        # Provision
+        PROV_BODY=$(printf '{"local_port":%d}' "$LOCAL_PORT")
+        PROV_RESP=$(curl -sS -X POST "$API_URL/api/v1/devices/$DEVICE_ID/provision" \
+            -H "Content-Type: application/json" -H "Authorization: Bearer $JWT" -d "$PROV_BODY")
+        PROV_ERR=$(echo "$PROV_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('error',''))" 2>/dev/null)
+        if [[ "$PROV_ERR" == "name_in_use" ]]; then
+            # Auto-release the existing reservation and retry once
+            OLD_TOKEN=$([[ -f "$FLEET" ]] && python3 -c "import json; print(json.load(open('$FLEET')).get('token',''))" 2>/dev/null)
+            if [[ -n "$OLD_TOKEN" ]]; then
+                log "server has $DEVICE_ID reserved; releasing token=${OLD_TOKEN:0:8}... and retrying"
+                curl -sS -X DELETE -H "Authorization: Bearer $JWT" \
+                    "$API_URL/api/v1/tunnels/$OLD_TOKEN" >/dev/null 2>&1 || true
+                PROV_RESP=$(curl -sS -X POST "$API_URL/api/v1/devices/$DEVICE_ID/provision" \
+                    -H "Content-Type: application/json" -H "Authorization: Bearer $JWT" -d "$PROV_BODY")
+                PROV_ERR=$(echo "$PROV_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('error',''))" 2>/dev/null)
+            fi
+        fi
+        if [[ -n "$PROV_ERR" ]]; then
+            err "provision failed: $PROV_RESP"
+        fi
+
+        # Parse bundle
+        BUNDLE=$(echo "$PROV_RESP" | python3 -c '
+import json, sys, shlex, base64
+d = json.load(sys.stdin)
+for k in ("device_id", "tunnel_user", "tunnel_port", "ssh_host",
+         "ssh_user", "ssh_port", "private_key", "ssh_command",
+         "fqdn", "token", "expires_at"):
+    v = d.get(k, "")
+    if k == "private_key":
+        v = "BASE64:" + base64.b64encode(v.encode()).decode()
+    print(f"{k}={shlex.quote(str(v))}")
+')
+        # shellcheck disable=SC2046
+        eval $(echo "$BUNDLE" | sed 's/private_key=/private_key_b64=/')
+        PRIVATE_KEY=$(echo "$private_key_b64" | sed 's/^BASE64://' | base64 -d)
+
+        # Persist
+        mkdir -p "$KLAN1_TUNNEL_HOME"
+        chmod 700 "$KLAN1_TUNNEL_HOME"
+        cat > "$FLEET" <<EOF
+{
+  "device_id": "$DEVICE_ID",
+  "tunnel_user": "$tunnel_user",
+  "tunnel_port": $tunnel_port,
+  "ssh_host": "$ssh_host",
+  "ssh_user": "$ssh_user",
+  "ssh_port": $ssh_port,
+  "api_url": "$API_URL",
+  "base_domain": "${fqdn#*.}",
+  "fqdn": "$fqdn",
+  "token": "$token",
+  "expires_at": "$expires_at"
+}
+EOF
+        chmod 600 "$FLEET"
+        KEY_PATH="$KLAN1_TUNNEL_HOME/id_ed25519_$tunnel_user"
+        printf '%s\n' "$PRIVATE_KEY" > "$KEY_PATH"
+        chmod 600 "$KEY_PATH"
+        log "saved: $FLEET + $KEY_PATH"
+        log "provisioned: tunnel=$tunnel_user@$ssh_host:$ssh_port fqdn=$fqdn"
+
+        # Start the SSH tunnel
+        log "starting tunnel"
+        nohup bash -c "$ssh_command" >"$TUNNEL_LOG" 2>&1 &
+        TUNNEL_PID=$!
+        disown $TUNNEL_PID 2>/dev/null || true
+        sleep 2
+        if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+            log "WARN: tunnel exited within 2s. Check $TUNNEL_LOG."
+        else
+            log "tunnel PID: $TUNNEL_PID"
+        fi
+    fi
+
+    # Start heartbeat (re-login for a fresh JWT)
+    if [[ -f "$HEARTBEAT_PID" ]] && kill -0 "$(cat "$HEARTBEAT_PID" 2>/dev/null)" 2>/dev/null; then
+        log "heartbeat already running"
+    else
+        LOGIN_BODY=$(printf '{"device_id":"%s","api_key":"%s"}' "$DEVICE_ID" "$API_KEY")
+        LOGIN_RESP=$(curl -sS -X POST "$API_URL/api/v1/auth/login" \
+            -H "Content-Type: application/json" -d "$LOGIN_BODY")
+        JWT=$(echo "$LOGIN_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('token',''))" 2>/dev/null)
+        TOKEN=$(python3 -c "import json; print(json.load(open('$FLEET')).get('token',''))" 2>/dev/null)
+        if [[ -n "$JWT" && -n "$TOKEN" ]]; then
+            nohup bash -c "
+set -u
+trap 'exit 0' TERM INT
+JWT='$JWT'
+TOKEN='$TOKEN'
+API='$API_URL'
+while true; do
+  curl -sS -X POST \"\$API/api/v1/tunnels/\$TOKEN/heartbeat\" \\
+      -H \"Authorization: Bearer \$JWT\" \\
+      -o /dev/null -w '%{http_code}\\n' >> '$HEARTBEAT_LOG' 2>&1
+  sleep 30
+done
+" >/dev/null 2>&1 &
+            HB_PID=$!
+            echo $HB_PID > "$HEARTBEAT_PID"
+            disown $HB_PID 2>/dev/null || true
+            log "heartbeat PID: $HB_PID (every 30s)"
+        fi
+    fi
+
+    # Print summary
+    FQDN=$(python3 -c "import json; print(json.load(open('$FLEET')).get('fqdn',''))" 2>/dev/null || echo "")
+    REMOTE_PORT=$(python3 -c "import json; print(json.load(open('$FLEET')).get('tunnel_port',''))" 2>/dev/null || echo "")
+    echo
+    echo "==== tunnel up ===="
+    echo "  local:    127.0.0.1:$LOCAL_PORT  (what your service binds to)"
+    echo "  tunnel:   $REMOTE_PORT on the server (forwarded by SSH to your localhost)"
+    echo "  public:   https://$FQDN"
+    echo
+    echo "Run:  klan1-tunel proxy   (to also expose a SOCKS5+HTTP proxy on 127.0.0.1:$LOCAL_PORT)"
+    echo "Stop: klan1-tunel down"
+}
+
+# ============================================================================
+# Subcommand: down
+# ============================================================================
+cmd_down() {
+    log "stopping heartbeat"
+    if [[ -f "$HEARTBEAT_PID" ]]; then
+        kill "$(cat "$HEARTBEAT_PID" 2>/dev/null)" 2>/dev/null || true
+        rm -f "$HEARTBEAT_PID"
+    fi
+    pkill -f "while true.*heartbeat" 2>/dev/null || true
+
+    log "stopping tunnel (ssh)"
+    if [[ -f "$FLEET" ]]; then
+        TUNNEL_USER=$(python3 -c "import json; print(json.load(open('$FLEET')).get('tunnel_user',''))" 2>/dev/null)
+        pkill -f "ssh.*${TUNNEL_USER}@" 2>/dev/null || true
+    fi
+
+    log "stopping pproxy (if running)"
+    pkill -f "pproxy.*-l" 2>/dev/null || true
+    [[ -f "$PPROXY_PID_FILE" ]] && rm -f "$PPROXY_PID_FILE"
+
+    log "done. tunnel is locally down. server-side reservation still active."
+    log "  - run \`klan1-tunel up\` to resume (auto-releases the reservation if expired)"
+    log "  - run \`klan1-tunel release\` to DELETE the reservation now"
+}
+
+# ============================================================================
+# Subcommand: release — DELETE the server-side tunnel
+# ============================================================================
+cmd_release() {
+    [[ -f "$FLEET" ]] || err "no fleet.json — nothing to release"
+    DEVICE_ID=$(cfg_get device_id) || err "no device_id in config"
+    API_URL="${KLAN1_TUNNEL_API_URL:-$(cfg_get api_url)}"
+    API_KEY="${KLAN1_TUNNEL_API_KEY:-$(cfg_get api_key)}"
+    TOKEN=$(python3 -c "import json; print(json.load(open('$FLEET')).get('token',''))" 2>/dev/null)
+    [[ -z "$TOKEN" ]] && err "no token in fleet.json"
+    LOGIN_RESP=$(curl -sS -X POST "$API_URL/api/v1/auth/login" \
+        -H "Content-Type: application/json" \
+        -d "$(printf '{"device_id":"%s","api_key":"%s"}' "$DEVICE_ID" "$API_KEY")")
+    JWT=$(echo "$LOGIN_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('token',''))" 2>/dev/null)
+    [[ -z "$JWT" ]] && err "login failed: $LOGIN_RESP"
+    log "releasing token=${TOKEN:0:8}..."
+    curl -sS -X DELETE -H "Authorization: Bearer $JWT" \
+        "$API_URL/api/v1/tunnels/$TOKEN" 2>&1
+    echo
+    log "done. fleet.json preserved; next \`klan1-tunel up\` will reprovision."
+}
+
+# ============================================================================
+# Subcommand: status
+# ============================================================================
+cmd_status() {
+    echo "==== klan1-tunel status ===="
+    echo
+    echo "config:   $CONFIG"
+    if [[ -f "$CONFIG" ]]; then
+        cat "$CONFIG" | sed 's/^/  /'
+    else
+        echo "  (missing — run: klan1-tunel init)"
+    fi
+    echo
+    echo "fleet:    $FLEET"
+    if [[ -f "$FLEET" ]]; then
+        cat "$FLEET" | sed 's/^/  /'
+    else
+        echo "  (no tunnel provisioned)"
+    fi
+    echo
+    echo "tunnel (ssh):"
+    if [[ -f "$FLEET" ]]; then
+        TUNNEL_USER=$(python3 -c "import json; print(json.load(open('$FLEET')).get('tunnel_user',''))" 2>/dev/null)
+        TUNNEL_PID=$(pgrep -f "ssh.*${TUNNEL_USER}@" 2>/dev/null | head -1)
+        if [[ -n "$TUNNEL_PID" ]]; then
+            echo "  PID=$TUNNEL_PID for $TUNNEL_USER"
+        else
+            echo "  NOT running"
+        fi
+    fi
+    echo
+    echo "heartbeat:"
+    if [[ -f "$HEARTBEAT_PID" ]] && kill -0 "$(cat "$HEARTBEAT_PID" 2>/dev/null)" 2>/dev/null; then
+        echo "  PID=$(cat "$HEARTBEAT_PID") (every 30s)"
+    else
+        echo "  NOT running"
+    fi
+    echo
+    echo "pproxy:"
+    if [[ -f "$PPROXY_PID_FILE" ]] && kill -0 "$(cat "$PPROXY_PID_FILE" 2>/dev/null)" 2>/dev/null; then
+        echo "  PID=$(cat "$PPROXY_PID_FILE")"
+    else
+        LOCAL_PORT=$(cfg_get local_port 2>/dev/null)
+        PPROXY_PID=$(pgrep -f "pproxy.*-l.*:${LOCAL_PORT:-.*}" 2>/dev/null | head -1)
+        if [[ -n "$PPROXY_PID" ]]; then
+            echo "  PID=$PPROXY_PID (no pid file)"
+        else
+            echo "  NOT running"
+        fi
+    fi
+}
+
+# ============================================================================
+# Subcommand: proxy
+# ============================================================================
+cmd_proxy() {
+    require_cmd curl python3
+    if ! command -v pproxy >/dev/null 2>&1; then
+        log "pproxy not found, installing via pip"
+        if ! python3 -m pip install --user pproxy 2>/dev/null; then
+            err "failed to install pproxy. Run manually: python3 -m pip install --user pproxy"
+        fi
+        if ! command -v pproxy >/dev/null 2>&1; then
+            for p in "$HOME/.local/bin/pproxy" "$HOME/Library/Python"*/bin/pproxy; do
+                [[ -x "$p" ]] && export PATH="$(dirname "$p"):$PATH" && break
+            done
+        fi
+        command -v pproxy >/dev/null 2>&1 || err "pproxy still not found after install"
+    fi
+
+    LOCAL_PORT=$(cfg_get local_port 2>/dev/null || echo 8080)
+    if pgrep -f "pproxy.*-l.*:${LOCAL_PORT}" >/dev/null 2>&1; then
+        log "pproxy already running on port $LOCAL_PORT"
+    else
+        # Ensure tunnel is up (otherwise pproxy on a non-tunneled port is useless
+        # for the public-URL use case)
+        if [[ ! -f "$FLEET" ]] || ! pgrep -f "ssh.*tunnel-" >/dev/null 2>&1; then
+            log "WARN: tunnel is not up. Run \`klan1-tunel up\` first."
+        fi
+        fuser -k "${LOCAL_PORT}/tcp" >/dev/null 2>&1 || true
+        sleep 0.3
+        log "starting pproxy on 127.0.0.1:${LOCAL_PORT} (http+socks5)"
+        nohup pproxy -l "http+socks5://127.0.0.1:${LOCAL_PORT}" \
+            >"$PPROXY_LOG" 2>&1 &
+        PPROXY_PID=$!
+        echo $PPROXY_PID > "$PPROXY_PID_FILE"
+        disown $PPROXY_PID 2>/dev/null || true
+        sleep 0.5
+        if ! kill -0 "$PPROXY_PID" 2>/dev/null; then
+            log "WARN: pproxy exited within 0.5s. Check $PPROXY_LOG."
+        else
+            log "pproxy PID: $PPROXY_PID"
+        fi
+    fi
+
+    FQDN=$(python3 -c "import json; print(json.load(open('$FLEET')).get('fqdn',''))" 2>/dev/null || echo "")
+    echo
+    echo "==== proxy running ===="
+    echo "  local  SOCKS5:  socks5://127.0.0.1:${LOCAL_PORT}"
+    echo "  local  HTTP:    http://127.0.0.1:${LOCAL_PORT}"
+    if [[ -n "$FQDN" ]]; then
+        echo "  public HTTP:    https://${FQDN}:443  (curl -x https://${FQDN}:443 http://target/)"
+    fi
+}
+
+# ============================================================================
+# Subcommand: logs
+# ============================================================================
+cmd_logs() {
+    local what="${1:-all}"
+    case "$what" in
+        tunnel)    tail -F "$TUNNEL_LOG" ;;
+        heartbeat) tail -F "$HEARTBEAT_LOG" ;;
+        pproxy)    tail -F "$PPROXY_LOG" ;;
+        all)
+            log "tailing all (Ctrl-C to stop)"
+            tail -F "$TUNNEL_LOG" "$HEARTBEAT_LOG" "$PPROXY_LOG"
+            ;;
+        *) err "unknown log target: $what (use tunnel|heartbeat|pproxy|all)" ;;
+    esac
+}
+
+# ============================================================================
+# Subcommand: set / unset / show / path
+# ============================================================================
+cmd_set() {
+    [[ $# -eq 2 ]] || err "usage: klan1-tunel set <key> <value>"
+    cfg_set "$1" "$2"
+    log "set $1=$2"
+}
+
+cmd_unset() {
+    [[ $# -eq 1 ]] || err "usage: klan1-tunel unset <key>"
+    cfg_unset "$1"
+    log "unset $1"
+}
+
+cmd_show() {
+    [[ -f "$CONFIG" ]] || err "no config — run: klan1-tunel init"
+    cat "$CONFIG"
+}
+
+cmd_path() {
+    echo "state_dir:  $KLAN1_TUNNEL_HOME"
+    echo "config:     $CONFIG"
+    echo "fleet:      $FLEET"
+    echo "tunnel_log: $TUNNEL_LOG"
+    echo "hb_log:     $HEARTBEAT_LOG"
+    echo "pproxy_log: $PPROXY_LOG"
+    echo "cli_dir:    $BIN_DIR"
+}
+
+# ============================================================================
+# Subcommand: version
+# ============================================================================
+cmd_version() {
+    echo "klan1-tunel $VERSION"
+    [[ -f "$CONFIG" ]] || { echo "(no config)"; return 0; }
+    API_URL=$(cfg_get api_url 2>/dev/null)
+    if [[ -n "$API_URL" ]]; then
+        echo
+        echo "server health:"
+        curl -sS --max-time 5 "$API_URL/healthz" 2>&1 | sed 's/^/  /' || true
+    fi
+}
+
+# ============================================================================
+# Subcommand: help
+# ============================================================================
+cmd_help() {
+    cat <<'USAGE'
+klan1-tunel — unified CLI for klan1-tunnel
+
+Usage: klan1-tunel <subcommand> [args...]
+
+Subcommands:
+  init         First-time setup: write ~/.klan1-tunnel/config.json
+  up           Provision + start tunnel + heartbeat
+  down         Stop tunnel + heartbeat + pproxy (server-side reservation kept)
+  release      DELETE the server-side tunnel reservation
+  status       Show config + fleet + tunnel + heartbeat + pproxy state
+  proxy        Launch pproxy (SOCKS5+HTTP) on the local port
+  logs [what]  Tail logs (what = tunnel|heartbeat|pproxy|all, default: all)
+  set K V      Edit config.json: K = V
+  unset K      Remove key K from config.json
+  show         Print config.json
+  path         Print paths to state files
+  version      Print klan1-tunel version + server health
+  help         This help
+
+Examples:
+  klan1-tunel init
+  klan1-tunel up
+  klan1-tunel proxy
+  klan1-tunel status
+  klan1-tunel logs tunnel
+  klan1-tunel set local_port 4096
+  klan1-tunel down
+USAGE
+}
+
+# ============================================================================
+# Dispatch
+# ============================================================================
+SUBCMD="${1:-help}"
+shift || true
+case "$SUBCMD" in
+    init)        cmd_init "$@" ;;
+    up)          cmd_up "$@" ;;
+    down)        cmd_down "$@" ;;
+    release)     cmd_release "$@" ;;
+    status)      cmd_status "$@" ;;
+    proxy)       cmd_proxy "$@" ;;
+    logs)        cmd_logs "$@" ;;
+    set)         cmd_set "$@" ;;
+    unset)       cmd_unset "$@" ;;
+    show)        cmd_show "$@" ;;
+    path)        cmd_path "$@" ;;
+    version|-v|--version) cmd_version "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *) err "unknown subcommand: \$SUBCMD (try: klan1-tunel help)" ;;
+esac
